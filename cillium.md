@@ -7,13 +7,23 @@
 4. [Infrastructure Prerequisites](#infrastructure-prerequisites)
     - [UCS B-Series Configuration](#ucs-b-series-configuration)
     - [ACI Fabric Integration Architecture](#aci-fabric-integration-architecture)
-    - [Kubernetes Node Network Configuration (Active/Backup)](#kubernetes-node-network-configuration-activebackup)
 5. [Kubernetes and OpenShift Cluster Preparation](#kubernetes-and-openshift-cluster-preparation)
+    - [Node Provisioning and OS Configuration](#node-provisioning-and-os-configuration)
+    - [Network Infrastructure Setup](#network-infrastructure-setup)
+    - [High Availability and Node Network Configuration](#high-availability-and-node-network-configuration)
 6. [Installing Cilium on Kubernetes](#installing-cilium-on-kubernetes)
-7. [Configuring eBGP Peering with ACI L3Outs](#configuring-ebgp-peering-with-aci-l3outs)
-    - [Advertising Pod and Service CIDRs](#advertising-pod-and-service-cidrs)
-    - [Bridge Domain for Node/Compute Network](#bridge-domain-for-nodecompute-network)
-    - [Scale Configurations and /32 Route Optimization](#scale-configurations-and-32-route-optimization)
+7. [ACI L3Out Configuration](#aci-l3out-configuration)
+    - [Creating Core ACI Objects](#creating-core-aci-objects)
+    - [Bridge Domain Configuration](#bridge-domain-configuration)
+    - [External EPG and Route Control](#external-epg-and-route-control)
+8. [Establishing eBGP Peering](#establishing-ebgp-peering)
+    - [Cilium BGP Configuration](#cilium-bgp-configuration)
+    - [Per-Node BGP Session Setup](#per-node-bgp-session-setup)
+    - [BGP Session Verification](#bgp-session-verification)
+9. [BGP Route Advertisements](#bgp-route-advertisements)
+    - [Pod CIDR Advertisement](#pod-cidr-advertisement)
+    - [Service CIDR Advertisement](#service-cidr-advertisement)
+    - [Route Monitoring and Troubleshooting](#route-monitoring-and-troubleshooting)
 8. [Firewalling with Cilium](#firewalling-with-cilium)
 9. [Conclusion](#conclusion)
 10. [References](#references)
@@ -24,40 +34,6 @@
 This document provides a comprehensive guide to deploying Cilium as a CNI on Kubernetes and OpenShift Container Platform (OCP), establishing eBGP peering with Cisco ACI L3Outs, advertising pod and service CIDRs, and integrating with UCS B-Series. It covers advanced topics such as scale optimization, firewalling, and high-availability node networking.
 
 The guide addresses both vanilla Kubernetes and OpenShift deployments, highlighting the differences in configuration, security contexts, and operational procedures. OpenShift's enterprise-focused features such as Security Context Constraints (SCCs), operators, and integrated monitoring are covered alongside traditional Kubernetes approaches.
-
-### Platform-Specific Requirements
-#### OpenShift Considerations:
-- OpenShift 4.10+ with cluster-admin privileges
-- Access to Red Hat OperatorHub for Cilium operator installation
-- Understanding of Security Context Constraints (SCCs)
-- Familiarity with OpenShift networking (OVN-Kubernetes default)
-- Machine Config Operator (MCO) access for node-level configurations
-
-#### Kubernetes Considerations:
-- Vanilla Kubernetes 1.23+ or managed distributions (EKS, GKE, AKS)
-- CNI replacement capabilities (removing existing CNI)
-
-### Network Infrastructure
-- Cisco ACI fabric, bridgedomain/EPG for node network, L3Outs for services and pods
-- UCS B-Series servers (B200 M5/M6, B480 M5, or newer recommended)
-- Fabric Interconnects (64108 or newer for optimal performance)
-- ACI fabric with APIC version 4.2+ (5.x+ recommended)
-- BGP ASN ranges planned (private ASNs - example: 64512-65534)
-
-### Access and Permissions
-- Administrative access to all systems (root/sudo on K8s nodes)
-- APIC admin access or tenant admin with L3Out privileges
-- Intersight account admin access for UCS management
-- Docker registry access for Cilium container images
-
-### Technical Knowledge
-- Deep familiarity with BGP routing protocols and AS path manipulation
-- Understanding of Kubernetes/OpenShift networking, CNI, and kube-proxy/OVN-Kubernetes
-- OpenShift-specific: Security Context Constraints, Operators, and Machine Configs
-- ACI fabric concepts: tenants, VRFs, bridge domains, EPGs, contracts
-- Linux networking: iptables, netfilter, eBPF, and network namespaces
-- Container networking fundamentals and overlay vs underlay concepts
-- Red Hat CoreOS administration and systemd service management (for OpenShift)
 
 ## Cilium Overview
 Cilium is an advanced CNI (Container Network Interface) for Kubernetes, providing:
@@ -87,7 +63,7 @@ Cilium is an advanced CNI (Container Network Interface) for Kubernetes, providin
 
 Before deploying Kubernetes/OpenShift clusters with Cilium, the underlying infrastructure must be properly configured. This section covers the essential infrastructure components that must be deployed and configured prior to cluster installation.
 
-## ACI Fabric Integration Architecture
+## ACI Fabric 
 
 ### Physical Infrastructure Design
 #### Topology Requirements:
@@ -95,19 +71,17 @@ Before deploying Kubernetes/OpenShift clusters with Cilium, the underlying infra
 Recommended Topology:
   Spine Switches: N9K-C9364C 
   Leaf Switches: N9K-C93180YC-EX or newer
-  APIC Controllers: 3-node cluster 
   
 Connection Standards:
   Spine-Leaf: 100G/400G QSFP+
   Leaf-UCS FI: 100G/400G QSFP+
 ```
 
-#### Cable Planning and Physical Connections:
 - **UCS FI to ACI Leaf**: Use vPC pairs for redundancy
 - **Minimum 2x 100G connections per FI to each leaf**
 - **Cable both FIs to both leafs in vPC configuration**
 
-## UCS B-Series Configuration
+## UCS B-Series Hardware
 
 ### Physical Connectivity and Hardware Specifications
 - **Supported Platforms**: UCS B200 M5/M6, B480 M5, or newer
@@ -248,124 +222,232 @@ Network Control Policy: k8s-network-control
 
    - Configure DNS resolution for cluster.local domain **Important**
 
-### 3. **High Availability and Redundancy**
-   - Configure nodes with dual vNICs for network redundancy
-   - Implement active/backup bonding at OS level (mode=1):
-   
-   **Active/Backup Bonding Configuration (mode=1):**
-   
-   #### For Kubernetes (systemd-networkd - Recommended):
-   ```bash
-   # /etc/systemd/network/10-bond0.netdev
-   [NetDev]
-   Name=bond0
-   Kind=bond
+### 3. **High Availability and Node Network Configuration**
 
-   [Bond]
-   Mode=active-backup
-   PrimaryReselectPolicy=always
-   MIIMonitorSec=100
-   UpDelaySec=200
-   DownDelaySec=200
-   
-   # /etc/systemd/network/20-bond0-ens3.network (Primary interface)
-   [Match]
-   Name=ens3
+Configure nodes with dual vNICs for network redundancy and implement active/backup bonding at the OS level for maximum availability.
 
-   [Network]
-   Bond=bond0
-   PrimarySlave=true
-   
-   # /etc/systemd/network/21-bond0-ens4.network (Secondary interface)
-   [Match]
-   Name=ens4
+#### UCS vNIC Configuration Prerequisites:
+Before configuring OS-level bonding, ensure proper UCS vNIC setup:
 
-   [Network]
-   Bond=bond0
-   
-   # /etc/systemd/network/30-bond0.network
-   [Match]
-   Name=bond0
+```yaml
+# UCS vNIC Templates (configured in Intersight)
+k8s-node-primary:
+  Fabric: A  
+  Redundancy Type: Primary
+  VLAN: 200 (Node Network - BGP Peering)
+  MTU: 9000
+  MAC Pool: k8s-node-mac-pool
+  
+k8s-node-secondary:
+  Fabric: B
+  Redundancy Type: Secondary  
+  VLAN: 200 (Node Network - BGP Peering)
+  MTU: 9000
+  MAC Pool: k8s-node-mac-pool
+```
 
-   [Network]
-   DHCP=no
-   Address=10.1.0.10/24  # Replace X with actual node IP
-   Gateway=10.1.0.1
-   DNS=10.1.0.53
-   DNS=8.8.8.8
-   
-   # Enable and restart networking
-   systemctl enable systemd-networkd
-   systemctl restart systemd-networkd
-   ```
-   
-   #### For OpenShift (Machine Config Operator):
-   ```yaml
-   apiVersion: machineconfiguration.openshift.io/v1
-   kind: MachineConfig
-   metadata:
-     labels:
-       machineconfiguration.openshift.io/role: worker
-     name: 99-worker-bond-config
-   spec:
-     config:
-       ignition:
-         version: 3.2.0
-       networkd:
-         units:
-         - name: 10-bond0.netdev
-           contents: |
-             [NetDev]
-             Name=bond0
-             Kind=bond
-             
-             [Bond]
-             Mode=active-backup
-             PrimaryReselectPolicy=always
-             MIIMonitorSec=100
-             UpDelaySec=200
-             DownDelaySec=200
-         - name: 20-bond0-ens3.network
-           contents: |
-             [Match]
-             Name=ens3
-             
-             [Network]
-             Bond=bond0
-             PrimarySlave=true
-         - name: 21-bond0-ens4.network
-           contents: |
-             [Match]
-             Name=ens4
-             
-             [Network]
-             Bond=bond0
-         - name: 30-bond0.network
-           contents: |
-             [Match]
-             Name=bond0
-             
-             [Network]
-             DHCP=no
-             Address=10.1.0.10/24  # Replace with actual node IP
-             Gateway=10.1.0.1
-             DNS=10.1.0.53
-             DNS=8.8.8.8
-   ```
-   
-   **Bond Status Verification:**
-   ```bash
-   # Check bond status
-   cat /proc/net/bonding/bond0
-   
-   # Verify active slave
-   cat /sys/class/net/bond0/bonding/active_slave
-   
-   # Monitor bond for failover testing
-   watch -n 1 'cat /sys/class/net/bond0/bonding/active_slave'
-   ```
-   
-   - Configure node anti-affinity for control plane components
+#### Active/Backup Bonding Configuration (mode=1):
+
+**For Kubernetes (systemd-networkd - Recommended):**
+```bash
+# /etc/systemd/network/10-bond0.netdev
+[NetDev]
+Name=bond0
+Kind=bond
+
+[Bond]
+Mode=active-backup
+PrimaryReselectPolicy=always
+MIIMonitorSec=100
+UpDelaySec=200
+DownDelaySec=200
+
+# /etc/systemd/network/20-bond0-ens3.network (Primary interface)
+[Match]
+Name=ens3
+
+[Network]
+Bond=bond0
+PrimarySlave=true
+
+# /etc/systemd/network/21-bond0-ens4.network (Secondary interface)
+[Match]
+Name=ens4
+
+[Network]
+Bond=bond0
+
+# /etc/systemd/network/30-bond0.network
+[Match]
+Name=bond0
+
+[Network]
+DHCP=no
+Address=10.1.0.10/24  # Replace with actual node IP
+Gateway=10.1.0.1
+DNS=10.1.0.53
+DNS=8.8.8.8
+
+[Route]
+Destination=10.244.0.0/16  # Kubernetes pod CIDR
+Gateway=10.1.0.1
+Metric=100
+
+# Enable and restart networking
+systemctl enable systemd-networkd
+systemctl restart systemd-networkd
+```
+
+**For Kubernetes (Legacy ifcfg - RHEL/CentOS):**
+```bash
+# /etc/sysconfig/network-scripts/ifcfg-bond0
+DEVICE=bond0
+TYPE=Bond
+BONDING_MASTER=yes
+BOOTPROTO=static
+IPADDR=10.1.0.10
+NETMASK=255.255.255.0
+GATEWAY=10.1.0.1
+DNS1=10.1.0.53
+DNS2=8.8.8.8
+BONDING_OPTS="mode=active-backup miimon=100 primary=ens3"
+ONBOOT=yes
+
+# /etc/sysconfig/network-scripts/ifcfg-ens3
+DEVICE=ens3
+TYPE=Ethernet
+BOOTPROTO=none
+MASTER=bond0
+SLAVE=yes
+ONBOOT=yes
+
+# /etc/sysconfig/network-scripts/ifcfg-ens4
+DEVICE=ens4
+TYPE=Ethernet  
+BOOTPROTO=none
+MASTER=bond0
+SLAVE=yes
+ONBOOT=yes
+```
+
+**For OpenShift (Machine Config Operator):**
+```yaml
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  labels:
+    machineconfiguration.openshift.io/role: worker
+  name: 99-worker-bond-config
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    networkd:
+      units:
+      - name: 10-bond0.netdev
+        contents: |
+          [NetDev]
+          Name=bond0
+          Kind=bond
+          
+          [Bond]
+          Mode=active-backup
+          PrimaryReselectPolicy=always
+          MIIMonitorSec=100
+          UpDelaySec=200
+          DownDelaySec=200
+      - name: 20-bond0-ens3.network
+        contents: |
+          [Match]
+          Name=ens3
+          
+          [Network]
+          Bond=bond0
+          PrimarySlave=true
+      - name: 21-bond0-ens4.network
+        contents: |
+          [Match]
+          Name=ens4
+          
+          [Network]
+          Bond=bond0
+      - name: 30-bond0.network
+        contents: |
+          [Match]
+          Name=bond0
+          
+          [Network]
+          DHCP=no
+          Address=10.1.0.10/24  # Replace with actual node IP
+          Gateway=10.1.0.1
+          DNS=10.1.0.53
+          DNS=8.8.8.8
+          
+          [Route]
+          Destination=10.128.0.0/14  # OpenShift pod CIDR
+          Gateway=10.1.0.1
+          Metric=100
+```
+
+#### Network Performance Optimization:
+```bash
+# /etc/sysctl.d/99-kubernetes-network.conf
+# Core networking
+net.core.somaxconn = 32768
+net.core.netdev_max_backlog = 5000
+net.core.netdev_budget = 600
+
+# TCP optimization
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.tcp_keepalive_intvl = 90
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# Buffer sizes
+net.core.rmem_default = 262144
+net.core.rmem_max = 134217728
+net.core.wmem_default = 262144
+net.core.wmem_max = 134217728
+
+# IPv4 routing optimization
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.forwarding = 1
+```
+
+#### Bond Status Verification:
+```bash
+# Check bond status
+cat /proc/net/bonding/bond0
+
+# Verify active slave
+cat /sys/class/net/bond0/bonding/active_slave
+
+# Monitor bond for failover testing
+watch -n 1 'cat /sys/class/net/bond0/bonding/active_slave'
+
+# Test failover by bringing down the primary interface
+ip link set ens3 down
+# Monitor for failover to secondary interface
+# Bring primary back up
+ip link set ens3 up
+```
+
+#### SR-IOV Configuration (Optional for High Performance):
+```bash
+# Enable SR-IOV in kernel
+# /etc/default/grub additions
+GRUB_CMDLINE_LINUX="intel_iommu=on iommu=pt pci=realloc"
+
+# Update grub and reboot
+update-grub && reboot
+
+# Enable VFs on physical interface
+echo 8 > /sys/class/net/ens3/device/sriov_numvfs
+echo 8 > /sys/class/net/ens4/device/sriov_numvfs
+```
+
+- Configure node anti-affinity for control plane components
 
 ## Installing Cilium on Kubernetes and OpenShift
 ### 1. **Prerequisites Verification**
@@ -613,18 +695,32 @@ Network Control Policy: k8s-network-control
            type: "Kubernetes"
    ```
 
-## Configuring eBGP Peering with ACI L3Outs
+## ACI L3Out Configuration
 
-### 1. **ACI L3Out Configuration**
-Essential ACI configuration for Cilium BGP integration:
+Before establishing BGP peering with Cilium, the ACI fabric must be properly configured with L3Outs, bridge domains, and external EPGs. This section covers the essential ACI infrastructure setup required for successful Cilium integration.
 
-#### Create Core ACI Objects:
+### 1. **Creating Core ACI Objects**
+
+#### Step 1: Create Tenant and VRF
+Configure the foundational ACI objects to host Kubernetes networks:
+
 ```yaml
-# Tenant and VRF
+# Tenant Configuration
 Tenant: k8s-prod
-VRF: k8s-vrf (Policy Control: enforced, Direction: ingress)
+Description: "Kubernetes Production Environment"
 
-# L3Out
+# VRF Configuration  
+VRF: k8s-vrf
+Policy Control: enforced
+Direction: ingress
+Route Target: auto-generated
+```
+
+#### Step 2: Create L3Out for External Connectivity
+Configure the L3Out that will peer with Cilium nodes:
+
+```yaml
+# L3Out Configuration
 Name: k8s-l3out
 VRF: k8s-vrf
 Domain: l3dom_k8s
@@ -634,24 +730,98 @@ BGP ASN: 65002
 Logical Node Profile: k8s-border-leafs
 Nodes: leaf-101, leaf-102
 Router ID Loopback: enabled
+BGP Route Reflector Client: disabled
 
-# BGP Peer Connectivity
-Peer IPs: <each_k8s_node_ip>
-Remote ASN: 65001 (Cilium)
-Local ASN: 65002 (ACI)
-Timers: Hold=180s, Keepalive=60s
-
-# External EPG
-Name: k8s-external-epg
-Route Control Subnets:
-  - 10.244.0.0/16 (K8s pods) - export-rtctrl
-  - 10.96.0.0/12 (K8s services) - export-rtctrl  
-  - 10.128.0.0/14 (OpenShift pods) - export-rtctrl
-  - 172.30.0.0/16 (OpenShift services) - export-rtctrl
+# Logical Interface Profile
+Logical Interface Profile: k8s-external-interfaces
+Interface Type: SVI or Routed
+MTU: 9000
 ```
 
-### 2. **Cilium BGP Configuration**
-Configure Cilium BGP peering with streamlined policy:
+### 2. **Bridge Domain Configuration**
+
+Create bridge domains for each Kubernetes network segment:
+
+#### Node Network Bridge Domain:
+```yaml
+Name: k8s-nodes-bd
+VRF: k8s-vrf
+Subnet: 10.1.0.0/24
+Gateway: 10.1.0.1
+Scope: Public, Shared
+ARP Flooding: enabled
+Unicast Routing: enabled
+Unknown Unicast: proxy
+```
+
+#### Pod Network Bridge Domains:
+```yaml
+# Kubernetes Pods
+Name: k8s-pods-bd
+VRF: k8s-vrf
+Subnet: 10.244.0.0/16
+Gateway: 10.244.0.1
+Scope: Public, Shared
+
+# OpenShift Pods (if applicable)
+Name: openshift-pods-bd
+VRF: k8s-vrf
+Subnet: 10.128.0.0/14
+Gateway: 10.128.0.1
+Scope: Public, Shared
+```
+
+#### Service Network Bridge Domains:
+```yaml
+# Kubernetes Services
+Name: k8s-services-bd
+VRF: k8s-vrf
+Subnet: 10.96.0.0/12
+Gateway: 10.96.0.1
+Scope: Public, Shared
+
+# OpenShift Services (if applicable)
+Name: openshift-services-bd  
+VRF: k8s-vrf
+Subnet: 172.30.0.0/16
+Gateway: 172.30.0.1
+Scope: Public, Shared
+```
+
+### 3. **External EPG and Route Control**
+
+Configure External EPG for route advertisement control:
+
+```yaml
+# External EPG Configuration
+Name: k8s-external-epg
+L3Out: k8s-l3out
+Preferred Group: enabled
+
+# Route Control Subnets (configured under External EPG)
+Route Control Subnets:
+  - 10.244.0.0/16 (K8s pods) - export-rtctrl, shared-rtctrl
+  - 10.96.0.0/12 (K8s services) - export-rtctrl, shared-rtctrl
+  - 10.128.0.0/14 (OpenShift pods) - export-rtctrl, shared-rtctrl  
+  - 172.30.0.0/16 (OpenShift services) - export-rtctrl, shared-rtctrl
+  - 0.0.0.0/0 (Default route) - import-security, shared-security
+```
+
+#### APIC Configuration Steps:
+1. Navigate to **Tenants → k8s-prod → Networking → L3Outs**
+2. Create **k8s-l3out** with proper VRF association
+3. Configure **Logical Node Profile** with border leaf switches
+4. Set up **BGP Peer Connectivity Profile** (will be configured per-node later)
+5. Create **External EPG** with route control subnets
+6. Associate bridge domains with appropriate EPGs
+
+## Establishing eBGP Peering
+
+With ACI L3Out infrastructure in place, the next step is to establish eBGP peering between Cilium nodes and ACI border leafs. This section covers both the Cilium configuration and the step-by-step process to bring up BGP sessions.
+
+### 1. **Cilium BGP Configuration**
+
+Deploy the Cilium BGP peering policy to enable eBGP sessions:
 
 ```yaml
 apiVersion: cilium.io/v2alpha1
@@ -664,92 +834,7 @@ spec:
       kubernetes.io/os: linux
   virtualRouters:
   - localASN: 65001
-    exportPodCIDR: true
-    exportPodCIDRMode: "local:true"  # Scale optimization
-    neighbors:
-    - peerAddress: <ACI_L3OUT_SVI_IP>/32
-      peerASN: 65002
-      eBGPMultihop: 2
-      holdTimeSeconds: 180
-      keepaliveTimeSeconds: 60
-      gracefulRestart:
-        enabled: true
-        restartTimeSeconds: 300
-      advertisements:
-      - advertisementType: "PodCIDR"
-        localPreference: 100
-        communities:
-          standard: ["65001:100"]
-      - advertisementType: "Service"
-        service:
-          matchLabels:
-            advertise-via-bgp: "true"
-        localPreference: 200
-        communities:
-          standard: ["65001:200"]
-```
-
-### 3. **Establishing eBGP Connections to Each Node**
-
-#### Per-Node BGP Peering Setup
-Cilium establishes eBGP sessions from each Kubernetes node to ACI border leaf switches. This section details the step-by-step process to bring up these connections.
-
-#### Step 1: Verify Node Network Connectivity
-Before establishing BGP sessions, ensure basic IP connectivity between each node and ACI border leafs:
-
-```bash
-# On each Kubernetes node, test connectivity to ACI border leaf SVIs
-ping 192.168.100.1  # Border leaf-101 SVI
-ping 192.168.100.5  # Border leaf-102 SVI
-
-# Verify routing to border leaf loopbacks (if using loopback peering)
-ping 10.1.1.101     # Border leaf-101 loopback
-ping 10.1.1.102     # Border leaf-102 loopback
-
-# Check MTU and ensure jumbo frames if configured
-ping -M do -s 8972 192.168.100.1  # Test with 9000 MTU
-```
-
-#### Step 2: Configure ACI Border Leaf BGP Peers
-For each Kubernetes node, add a BGP peer configuration in ACI:
-
-```bash
-# ACI Border Leaf Configuration (via APIC or CLI)
-# Example for node k8s-worker-01 (IP: 10.1.0.10)
-
-# APIC GUI Path: Tenants > k8s-prod > Networking > L3Outs > k8s-l3out 
-# > Logical Node Profiles > k8s-border-leafs > BGP Peer Connectivity Profiles
-
-BGP_Peer_Configuration:
-  Peer_Address: 10.1.0.10      # Kubernetes node IP
-  Remote_ASN: 65001            # Cilium ASN
-  Local_ASN: 65002             # ACI L3Out ASN
-  Connection_Mode: bidirectional
-  Address_Family: ipv4-ucast
-  Hold_Timer: 180              # Seconds
-  Keepalive_Timer: 60          # Seconds
-  Password: <optional>         # BGP MD5 authentication
-  BFD: enabled                 # Fast failure detection
-  Send_Community: enabled      # For route tagging
-  Send_Extended_Community: enabled
-```
-
-#### Step 3: Apply Cilium BGP Configuration
-Create or update the CiliumBGPPeeringPolicy to establish sessions with each border leaf:
-
-```yaml
-apiVersion: cilium.io/v2alpha1
-kind: CiliumBGPPeeringPolicy
-metadata:
-  name: aci-node-peering
-spec:
-  nodeSelector:
-    matchLabels:
-      kubernetes.io/os: linux
-  virtualRouters:
-  - localASN: 65001
-    exportPodCIDR: true
-    exportPodCIDRMode: "local:true"
+    # Note: exportPodCIDR and advertisements will be configured in the next section
     neighbors:
     # Peer with border leaf-101
     - peerAddress: "192.168.100.1/32"  # Border leaf-101 SVI
@@ -760,8 +845,198 @@ spec:
       gracefulRestart:
         enabled: true
         restartTimeSeconds: 300
-    # Peer with border leaf-102  
+    # Peer with border leaf-102
+    - peerAddress: "192.168.100.5/32"  # Border leaf-102 SVI  
+      peerASN: 65002
+      eBGPMultihop: 2
+      holdTimeSeconds: 180
+      keepaliveTimeSeconds: 60
+      gracefulRestart:
+        enabled: true
+        restartTimeSeconds: 300
+```
+
+### 3. **Establishing eBGP Connections to Each Node**
+
+### 2. **Per-Node BGP Session Setup**
+
+#### Step 1: Verify Node Network Connectivity
+Ensure basic IP connectivity before establishing BGP sessions:
+
+```bash
+# On each Kubernetes node, test connectivity to ACI border leaf SVIs
+ping 192.168.100.1  # Border leaf-101 SVI
+ping 192.168.100.5  # Border leaf-102 SVI
+
+# Verify MTU and jumbo frames if configured
+ping -M do -s 8972 192.168.100.1  # Test with 9000 MTU
+```
+
+#### Step 2: Configure ACI BGP Peers for Each Node
+For each Kubernetes node, add BGP peer configuration in ACI:
+
+**APIC Configuration Path:**
+`Tenants → k8s-prod → Networking → L3Outs → k8s-l3out → Logical Node Profiles → k8s-border-leafs → BGP Peer Connectivity Profiles`
+
+**Per-Node BGP Peer Configuration:**
+```yaml
+# Example for node k8s-worker-01 (IP: 10.1.0.10)
+BGP_Peer_Configuration:
+  Peer_Address: 10.1.0.10      # Kubernetes node IP
+  Remote_ASN: 65001            # Cilium ASN
+  Local_ASN: 65002             # ACI L3Out ASN  
+  Connection_Mode: bidirectional
+  Address_Family: ipv4-ucast
+  Hold_Timer: 180              # Seconds
+  Keepalive_Timer: 60          # Seconds
+  BFD: enabled                 # Fast failure detection
+  Send_Community: enabled      # For route tagging
+  Send_Extended_Community: enabled
+```
+
+Repeat this configuration for each Kubernetes node in the cluster.
+
+#### Step 3: Apply Cilium BGP Policy
+Deploy the BGP peering policy:
+
+```bash
+# Kubernetes
+kubectl apply -f cilium-bgp-peering-policy.yaml
+
+# OpenShift
+oc apply -f cilium-bgp-peering-policy.yaml
+```
+
+### 3. **BGP Session Verification**
+
+#### Verify BGP Session Establishment
+Monitor BGP session status from both sides:
+
+```bash
+# Kubernetes - Check BGP session status
+kubectl exec -n kube-system ds/cilium -- cilium bgp peers
+# Expected: "Established" state for both border leaf peers
+
+# OpenShift - Check BGP session status  
+oc exec -n cilium ds/cilium-agent -- cilium bgp peers
+```
+
+#### ACI Side Verification
+```bash
+# On ACI Border Leaf
+show bgp ipv4 unicast summary vrf k8s-vrf
+
+# Expected output example:
+# Neighbor        V    AS MsgRcvd MsgSent   TblVer  InQ OutQ Up/Down  State/PfxRcd
+# 10.1.0.10       4 65001      45      42        8    0    0 00:15:23        0
+# 10.1.0.11       4 65001      43      40        8    0    0 00:14:56        0
+
+# Check specific neighbor details
+show bgp ipv4 unicast neighbors 10.1.0.10 vrf k8s-vrf
+```
+
+#### Troubleshooting BGP Sessions
+Common issues and solutions:
+
+1. **Session Stuck in Active/Connect:**
+   - Verify IP connectivity between nodes and border leafs
+   - Check firewall rules allowing BGP port 179
+   - Confirm ASN configuration matches on both sides
+
+2. **Timer Mismatches:**
+   - Ensure hold/keepalive timers match between Cilium and ACI
+   - ACI: 180s hold, 60s keepalive
+   - Cilium: Same timers in BGP policy
+
+## BGP Route Advertisements
+
+Once BGP sessions are established, configure and verify route advertisements for pod CIDRs and service networks. This section covers the configuration of BGP advertisements and monitoring.
+
+### 1. **Pod CIDR Advertisement**
+
+Update the Cilium BGP policy to enable pod CIDR advertisements:
+
+```yaml
+apiVersion: cilium.io/v2alpha1  
+kind: CiliumBGPPeeringPolicy
+metadata:
+  name: aci-bgp-peering-with-pods
+spec:
+  nodeSelector:
+    matchLabels:
+      kubernetes.io/os: linux
+  virtualRouters:
+  - localASN: 65001
+    exportPodCIDR: true
+    exportPodCIDRMode: "local:true"  # Each node advertises only its local pod subnet
+    neighbors:
+    - peerAddress: "192.168.100.1/32"  # Border leaf-101 SVI
+      peerASN: 65002
+      eBGPMultihop: 2
+      holdTimeSeconds: 180
+      keepaliveTimeSeconds: 60
+      gracefulRestart:
+        enabled: true
+        restartTimeSeconds: 300
     - peerAddress: "192.168.100.5/32"  # Border leaf-102 SVI
+      peerASN: 65002
+      eBGPMultihop: 2
+      holdTimeSeconds: 180
+      keepaliveTimeSeconds: 60
+      gracefulRestart:
+        enabled: true
+        restartTimeSeconds: 300
+    advertisements:
+    - advertisementType: "PodCIDR"
+      localPreference: 100
+      communities:
+        standard: ["65001:100"]
+```
+
+#### Pod CIDR Advertisement Modes:
+- **exportPodCIDRMode: "local:true"**: Each node advertises only its allocated pod subnet (/24 from cluster /16)
+  - Benefits: Reduces BGP table size, improves convergence, enables traffic engineering
+- **exportPodCIDRMode: "false"** (default): All nodes advertise the entire cluster pod CIDR
+
+#### Verify Pod CIDR Advertisement:
+```bash
+# Check advertised routes from Cilium
+kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised
+
+# Expected output: Each node advertises its local pod CIDR (e.g., 10.244.1.0/24)
+
+# Verify routes received on ACI border leafs
+show bgp ipv4 unicast vrf k8s-vrf | include 10.244
+# Expected: Per-node pod CIDR routes
+```
+
+### 2. **Service CIDR Advertisement**
+
+Configure service advertisements by updating the BGP policy:
+
+```yaml
+apiVersion: cilium.io/v2alpha1
+kind: CiliumBGPPeeringPolicy
+metadata:
+  name: aci-bgp-peering-with-services
+spec:
+  nodeSelector:
+    matchLabels:
+      kubernetes.io/os: linux
+  virtualRouters:
+  - localASN: 65001
+    exportPodCIDR: true
+    exportPodCIDRMode: "local:true"
+    neighbors:
+    - peerAddress: "192.168.100.1/32"
+      peerASN: 65002
+      eBGPMultihop: 2
+      holdTimeSeconds: 180
+      keepaliveTimeSeconds: 60
+      gracefulRestart:
+        enabled: true
+        restartTimeSeconds: 300
+    - peerAddress: "192.168.100.5/32"
       peerASN: 65002
       eBGPMultihop: 2
       holdTimeSeconds: 180
@@ -777,154 +1052,15 @@ spec:
     - advertisementType: "Service"
       service:
         matchLabels:
-          advertise-via-bgp: "true"
+          advertise-via-bgp: "true"  # Only advertise services with this label
       localPreference: 200
       communities:
         standard: ["65001:200"]
 ```
 
-#### Step 4: Verify BGP Session Establishment
-Monitor BGP session establishment from both Cilium and ACI perspectives:
-
-```bash
-# Kubernetes - Check BGP session status
-kubectl exec -n kube-system ds/cilium -- cilium bgp peers
-# Expected output: Established sessions to both border leaf SVIs
-
-# Kubernetes - Verify route advertisements
-kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised
-# Expected: Local pod CIDR (/24) and service IPs advertised
-
-# OpenShift - Check BGP session status
-oc exec -n cilium ds/cilium-agent -- cilium bgp peers
-oc exec -n cilium ds/cilium-agent -- cilium bgp routes advertised
-```
-
-#### Step 5: ACI Side Verification
-Verify BGP sessions and received routes on ACI border leafs:
-
-```bash
-# On ACI Border Leaf (via SSH or APIC)
-# Check BGP session summary
-show bgp ipv4 unicast summary vrf k8s-vrf
-
-# Expected output example:
-# Neighbor        V    AS MsgRcvd MsgSent   TblVer  InQ OutQ Up/Down  State/PfxRcd
-# 10.1.0.10       4 65001      45      42        8    0    0 00:15:23        2
-# 10.1.0.11       4 65001      43      40        8    0    0 00:14:56        2
-
-# Check specific BGP neighbor details
-show bgp ipv4 unicast neighbors 10.1.0.10 vrf k8s-vrf
-
-# Verify received routes from Cilium nodes
-show bgp ipv4 unicast vrf k8s-vrf | include 10.244
-# Expected: Per-node pod CIDR routes (e.g., 10.244.1.0/24, 10.244.2.0/24)
-
-# Check route table entries
-show ip route vrf k8s-vrf 10.244.0.0/16
-```
-
-#### Step 6: Troubleshooting BGP Session Issues
-
-**Common Issues and Solutions:**
-
-1. **BGP Session Stuck in Active/Connect State:**
-```bash
-# Check connectivity
-kubectl exec -n kube-system ds/cilium -- cilium bgp peers
-# Look for "Active" or "Connect" state instead of "Established"
-
-# Verify ACI border leaf configuration
-show bgp ipv4 unicast neighbors 10.1.0.10 vrf k8s-vrf | include state
-```
-
-2. **ASN Mismatch:**
-```bash
-# Verify ASN configuration on both sides
-kubectl get ciliumbgppeeringpolicies -o yaml | grep -A5 -B5 ASN
-# Should show localASN: 65001, peerASN: 65002
-```
-
-3. **Timer Mismatch:**
-```bash
-# Check BGP timer alignment
-show bgp ipv4 unicast neighbors 10.1.0.10 vrf k8s-vrf | include timer
-# Hold time should be 180s, keepalive 60s on both sides
-```
-
-4. **Firewall/ACL Blocking:**
-```bash
-# Verify BGP port 179 connectivity
-kubectl exec -n kube-system ds/cilium -- netstat -tuln | grep 179
-# Should show listening on port 179
-
-# Test from node to border leaf
-telnet 192.168.100.1 179
-```
-
-#### Step 7: Validate End-to-End Connectivity
-Once BGP sessions are established, test end-to-end connectivity:
-
-```bash
-# Test pod-to-external connectivity
-kubectl run test-pod --image=busybox --rm -it -- ping 8.8.8.8
-
-# Verify service advertisement
-kubectl create service loadbalancer test-svc --tcp=80:80
-kubectl label service test-svc advertise-via-bgp=true
-
-# Check if service IP is advertised via BGP
-kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised | grep test-svc
-```
-
-#### Step 8: Production Readiness Checklist
-
-**Pre-Production Validation:**
-- [ ] All nodes have established BGP sessions to both border leafs
-- [ ] Pod CIDRs are correctly advertised as /24 subnets
-- [ ] Service IPs are advertised only from nodes with endpoints
-- [ ] BGP graceful restart is functioning during node maintenance
-- [ ] Route convergence time meets SLA requirements (<30 seconds)
-- [ ] BGP session monitoring and alerting is configured
-
-**Monitoring Commands for Production:**
-```bash
-# Continuous BGP monitoring script
-#!/bin/bash
-while true; do
-  echo "=== BGP Session Status $(date) ==="
-  kubectl exec -n kube-system ds/cilium -- cilium bgp peers | grep -E "(Peer|Established|Active)"
-  echo "=== Route Count ==="
-  kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised | wc -l
-  sleep 30
-done
-```
-
-### 4. **BGP Monitoring and Troubleshooting**
-
-#### Essential Commands:
-```bash
-# Kubernetes
-kubectl exec -n kube-system ds/cilium -- cilium bgp peers
-kubectl exec -n kube-system ds/cilium -- cilium bgp routes
-
-# OpenShift  
-oc exec -n cilium ds/cilium-agent -- cilium bgp peers
-oc exec -n cilium ds/cilium-agent -- cilium bgp routes
-
-# ACI APIC/Border Leaf
-show bgp ipv4 unicast summary vrf k8s-vrf
-show ip route vrf k8s-vrf 10.244.0.0/16
-```
-
-### 4. **Pod and Service CIDR Advertisement**
-
-#### Advertisement Modes:
-- **exportPodCIDRMode: "local:true"**: Each node advertises only its allocated pod subnet (/24 from cluster /16)
-  - Benefits: Reduces BGP table size, improves convergence, enables traffic engineering
-- **Service Advertisement**: Controlled by `externalTrafficPolicy` setting
-  - **Local**: Only nodes with pods advertise service IP as /32 (recommended for performance)
-  - **Cluster**: All nodes advertise entire service CIDR
+#### Service Advertisement Modes:
+- **Local Traffic Policy**: Only nodes with pods advertise service IP as /32 (recommended for performance)
+- **Cluster Traffic Policy**: All nodes advertise entire service CIDR
 
 #### Example Service Configuration:
 ```yaml
@@ -944,27 +1080,86 @@ spec:
     targetPort: 8080
 ```
 
-### 5. **Required Bridge Domains**
-Create bridge domains in ACI for Kubernetes networks:
+#### Verify Service Advertisement:
+```bash
+# Create test service
+kubectl create service loadbalancer test-svc --tcp=80:80
+kubectl label service test-svc advertise-via-bgp=true
 
-```yaml
-# Required Bridge Domains
-k8s-nodes-bd: 10.1.0.0/24 (Node network)
-k8s-pods-bd: 10.244.0.0/16 (K8s pods) 
-k8s-services-bd: 10.96.0.0/12 (K8s services)
-openshift-pods-bd: 10.128.0.0/14 (OpenShift pods)
-openshift-services-bd: 172.30.0.0/16 (OpenShift services)
+# Check if service IP is advertised
+kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised | grep -A5 -B5 test-svc
 
-# Bridge Domain Settings (for all)
-VRF: k8s-vrf
-ARP Flooding: enabled
-Unicast Routing: enabled
-Scope: Public, Shared
+# Verify on ACI side
+show bgp ipv4 unicast vrf k8s-vrf | include 10.96
 ```
 
-## Advanced ACI L3Out Best Practices and Optimization
+### 3. **Route Monitoring and Troubleshooting**
 
-*Based on Cisco ACI L3Out White Paper recommendations*
+#### Comprehensive Route Verification:
+```bash
+# Kubernetes - Check all BGP routes
+kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised
+kubectl exec -n kube-system ds/cilium -- cilium bgp routes received
+
+# OpenShift - Check all BGP routes
+oc exec -n cilium ds/cilium-agent -- cilium bgp routes advertised
+oc exec -n cilium ds/cilium-agent -- cilium bgp routes received
+
+# ACI - Verify received routes
+show bgp ipv4 unicast summary vrf k8s-vrf
+show bgp ipv4 unicast vrf k8s-vrf
+show ip route vrf k8s-vrf 10.244.0.0/16
+show ip route vrf k8s-vrf 10.96.0.0/12
+```
+
+#### Production Monitoring Script:
+```bash
+#!/bin/bash
+# BGP Route Advertisement Monitoring
+while true; do
+  echo "=== BGP Session Status $(date) ==="
+  kubectl exec -n kube-system ds/cilium -- cilium bgp peers | grep -E "(Peer|Established|Active)"
+  
+  echo "=== Pod CIDR Routes ==="
+  kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised | grep -c "10.244"
+  
+  echo "=== Service Routes ==="
+  kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised | grep -c "10.96"
+  
+  sleep 30
+done
+```
+
+#### Common Troubleshooting Issues:
+
+1. **Routes Not Being Advertised:**
+   - Verify `exportPodCIDR: true` in BGP policy
+   - Check service labels for `advertise-via-bgp: "true"`
+   - Confirm BGP sessions are in "Established" state
+
+2. **Partial Route Advertisement:**
+   - Check `exportPodCIDRMode` setting
+   - Verify all nodes have BGP sessions established
+   - Review ACI External EPG route control subnets
+
+3. **Route Black Holes:**
+   - Verify bridge domain associations in ACI
+   - Check ACI route table entries match advertised routes
+   - Confirm proper next-hop reachability
+```bash
+# Kubernetes
+kubectl exec -n kube-system ds/cilium -- cilium bgp peers
+kubectl exec -n kube-system ds/cilium -- cilium bgp routes
+
+# OpenShift  
+oc exec -n cilium ds/cilium-agent -- cilium bgp peers
+oc exec -n cilium ds/cilium-agent -- cilium bgp routes
+
+# ACI APIC/Border Leaf
+show bgp ipv4 unicast summary vrf k8s-vrf
+
+
+## Advanced ACI L3Out Best Practices and Optimization
 
 ### 1. **BGP Configuration Best Practices**
 
@@ -1099,40 +1294,6 @@ kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised
 
 # Verify route reception
 kubectl exec -n kube-system ds/cilium -- cilium bgp routes received
-```
-
-#### ACI Health Monitoring:
-- **APIC Monitoring**: Track BGP session state and route counts
-- **Interface Utilization**: Monitor border leaf interface usage
-- **Contract Hit Counters**: Verify security policy effectiveness
-- **Fabric Health**: Check spine-leaf ISIS and MP-BGP sessions
-
-### 6. **Security Integration**
-
-#### ACI Contract Integration:
-```yaml
-# Cilium policies aligned with ACI contracts
-apiVersion: cilium.io/v2
-kind: CiliumClusterwideNetworkPolicy
-metadata:
-  name: aci-integrated-security
-spec:
-  endpointSelector:
-    matchLabels:
-      environment: "production"
-  egress:
-  - toCIDR:
-    - "10.0.0.0/8"  # Match ACI external EPG scope
-    toPorts:
-    - ports:
-      - port: "443"
-        protocol: TCP
-      - port: "80"
-        protocol: TCP
-  - toServices:
-    - k8sService:
-        serviceName: external-api
-        namespace: production
 ```
 
 ### 7. **Troubleshooting and Validation**
@@ -1412,74 +1573,7 @@ data:
   pod-security-standards: "restricted"
 ```
 
-## Advanced Kubernetes and OpenShift Node Network Configuration
-### 1. **Enterprise-Grade Network Bonding Configuration**
-
-#### Modern systemd-networkd Configuration (Recommended for both K8s and OpenShift):
-
-
-#### 2. **Boot and BIOS Policies**
-```yaml
-Server Profile Template: k8s-node-template
-  Boot Policy: k8s-uefi-boot
-    Boot Mode: UEFI
-    Secure Boot: Enabled
-  
-  BIOS Policy: k8s-performance-bios
-    CPU Settings:
-      Intel Turbo Boost: Enabled
-      Intel Hyper-Threading: Enabled
-      CPU Performance: Enterprise
-      Energy Performance: Performance
-    Memory Settings:
-      NUMA Optimizations: Enabled
-      Memory RAS: Maximum Performance
-    PCIe Settings:
-      SR-IOV: Enabled
-      ARI Support: Enabled
-```
-
-#### 3. **vNIC Configuration**
-```yaml
-vNIC Templates:
-    
-  k8s-node-primary:
-    Fabric: A  
-    Redundancy Type: Primary
-    VLAN: 200 (Node Network - BGP Peering)
-    MTU: 9000
-    MAC Pool: k8s-node-mac-pool
-    Pin Group: k8s-node-pin-group
-    QoS Policy: k8s-high-priority
-    
-  k8s-node-secondary:
-    Fabric: B
-    Redundancy Type: Secondary  
-    VLAN: 200 (Node Network - BGP Peering)
-    MTU: 9000
-    MAC Pool: k8s-node-mac-pool
-    Pin Group: k8s-node-pin-group
-    QoS Policy: k8s-high-priority
-```
-
-#### 4. **QoS and Traffic Management**
-```yaml
-QoS Policy: k8s-high-priority
-  Priority: Platinum
-  Burst Size: 65536
-  Rate Limit: 0 # Unlimited
-  Host Control: Full
-  
-Network Control Policy: k8s-network-control
-  CDP: Enabled
-  LLDP Transmit: Enabled
-  LLDP Receive: Enabled
-  MAC Registration Mode: All Host VLANs
-  Action on Uplink Fail: Link Down
-  Forge MAC: Allow
-```
-
-### Detailed ACI Configuration for Kubernetes Integration
+### Summary:
 
 For manual ACI configuration or infrastructure as code automation, create the following objects in APIC:
 
@@ -1496,261 +1590,13 @@ For manual ACI configuration or infrastructure as code automation, create the fo
 - **VRF Policy**: Ingress policy control with enforced direction
 - **External EPG Subnets**: Use export-rtctrl scope for Kubernetes networks
 
-
-## Advanced Kubernetes and OpenShift Node Network Configuration
-### 1. **Enterprise-Grade Network Bonding Configuration**
-
-#### Modern systemd-networkd Configuration (Recommended for both K8s and OpenShift):
-```bash
-# /etc/systemd/network/10-bond0.netdev
-[NetDev]
-Name=bond0
-Kind=bond
-
-[Bond]
-Mode=active-backup
-PrimaryReselectPolicy=always
-MIIMonitorSec=100
-UpDelaySec=200
-DownDelaySec=200
-```
-
-```bash
-# /etc/systemd/network/20-bond0-ens3.network
-[Match]
-Name=ens3
-
-[Network]
-Bond=bond0
-PrimarySlave=true
-```
-
-```bash
-# /etc/systemd/network/21-bond0-ens4.network  
-[Match]
-Name=ens4
-
-[Network]
-Bond=bond0
-```
-
-```bash
-# /etc/systemd/network/30-bond0.network
-[Match]
-Name=bond0
-
-[Network]
-DHCP=no
-Address=10.1.0.10/24
-Gateway=10.1.0.1
-DNS=10.1.0.53
-DNS=8.8.8.8
-
-[Route]
-Destination=10.244.0.0/16
-Gateway=10.1.0.1
-Metric=100
-```
-
-#### Legacy ifenslave Configuration (RHEL/CentOS for Kubernetes):
-```bash
-# /etc/sysconfig/network-scripts/ifcfg-bond0
-DEVICE=bond0
-TYPE=Bond
-BONDING_MASTER=yes
-BOOTPROTO=static
-IPADDR=10.1.0.10
-NETMASK=255.255.255.0
-GATEWAY=10.1.0.1
-DNS1=10.1.0.53
-DNS2=8.8.8.8
-BONDING_OPTS="mode=active-backup miimon=100 primary=ens3"
-ONBOOT=yes
-
-# /etc/sysconfig/network-scripts/ifcfg-ens3
-DEVICE=ens3
-TYPE=Ethernet
-BOOTPROTO=none
-MASTER=bond0
-SLAVE=yes
-ONBOOT=yes
-
-# /etc/sysconfig/network-scripts/ifcfg-ens4
-DEVICE=ens4
-TYPE=Ethernet  
-BOOTPROTO=none
-MASTER=bond0
-SLAVE=yes
-ONBOOT=yes
-```
-
-#### OpenShift RHCOS Network Configuration via Machine Config:
-```yaml
-apiVersion: machineconfiguration.openshift.io/v1
-kind: MachineConfig
-metadata:
-  labels:
-    machineconfiguration.openshift.io/role: worker
-  name: 99-worker-bond-config
-spec:
-  config:
-    ignition:
-      version: 3.2.0
-    networkd:
-      units:
-      - name: 10-bond0.netdev
-        contents: |
-          [NetDev]
-          Name=bond0
-          Kind=bond
-          
-          [Bond]
-          Mode=active-backup
-          PrimaryReselectPolicy=always
-          MIIMonitorSec=100
-          UpDelaySec=200
-          DownDelaySec=200
-      - name: 20-bond0-ens3.network
-        contents: |
-          [Match]
-          Name=ens3
-          
-          [Network]
-          Bond=bond0
-          PrimarySlave=true
-      - name: 21-bond0-ens4.network
-        contents: |
-          [Match]
-          Name=ens4
-          
-          [Network]
-          Bond=bond0
-      - name: 30-bond0.network
-        contents: |
-          [Match]
-          Name=bond0
-          
-          [Network]
-          DHCP=no
-          Address=10.1.0.10/24
-          Gateway=10.1.0.1
-          DNS=10.1.0.53
-          DNS=8.8.8.8
-```
-
-### 2. **SR-IOV Configuration for High Performance**
-#### Enable SR-IOV in kernel:
-```bash
-# /etc/default/grub additions
-GRUB_CMDLINE_LINUX="intel_iommu=on iommu=pt pci=realloc"
-
-# Update grub and reboot
-update-grub && reboot
-
-# Verify SR-IOV capability
-lspci -v | grep -i sriov
-```
-
-#### SR-IOV VF Configuration:
-```bash
-# Enable VFs on physical interface
-echo 8 > /sys/class/net/ens3/device/sriov_numvfs
-echo 8 > /sys/class/net/ens4/device/sriov_numvfs
-
-# Persistent VF configuration
-cat > /etc/systemd/system/sriov-vfs.service << EOF
-[Unit]
-Description=Configure SR-IOV VFs
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash -c 'echo 8 > /sys/class/net/ens3/device/sriov_numvfs'
-ExecStart=/bin/bash -c 'echo 8 > /sys/class/net/ens4/device/sriov_numvfs'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl enable sriov-vfs.service
-```
-
-### 3. **Advanced Network Optimization**
-#### Kernel Network Stack Tuning:
-```bash
-# /etc/sysctl.d/99-kubernetes-network.conf
-# Core networking
-net.core.somaxconn = 32768
-net.core.netdev_max_backlog = 5000
-net.core.netdev_budget = 600
-net.core.netdev_budget_usecs = 5000
-
-# TCP optimization
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_probes = 3
-net.ipv4.tcp_keepalive_intvl = 90
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_tw_reuse = 1
-
-# Buffer sizes
-net.core.rmem_default = 262144
-net.core.rmem_max = 134217728
-net.core.wmem_default = 262144
-net.core.wmem_max = 134217728
-net.ipv4.tcp_rmem = 4096 65536 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-
-# IPv4 routing optimization
-net.ipv4.ip_forward = 1
-net.ipv4.conf.all.forwarding = 1
-net.ipv4.conf.all.route_localnet = 1
-net.ipv4.ip_nonlocal_bind = 1
-
-# eBPF and netfilter optimization
-net.netfilter.nf_conntrack_max = 1048576
-net.netfilter.nf_conntrack_buckets = 262144
-net.netfilter.nf_conntrack_tcp_timeout_established = 86400
-```
-
-#### IRQ Balancing and CPU Affinity:
-```bash
-# Install irqbalance
-apt-get install irqbalance
-
-# Configure irqbalance for NUMA awareness
-cat > /etc/default/irqbalance << EOF
-IRQBALANCE_ARGS="--policyscript=/usr/local/bin/irq-policy.sh"
-EOF
-
-# Custom IRQ policy script
-cat > /usr/local/bin/irq-policy.sh << 'EOF'
-#!/bin/bash
-# Assign network IRQs to specific CPU cores
-case "$1" in
-    ens3|ens4)
-        echo "package:0 cache:0"
-        ;;
-    *)
-        echo "ignore"
-        ;;
-esac
-EOF
-
-chmod +x /usr/local/bin/irq-policy.sh
-```
-
 ## Conclusion
 Deploying Cilium with eBGP peering to Cisco ACI L3Outs represents a sophisticated approach to enterprise Kubernetes networking that bridges the gap between cloud-native workloads and traditional data center infrastructure. This comprehensive integration enables organizations to leverage the advanced networking capabilities of both platforms while maintaining the security, observability, and scalability requirements of modern enterprise environments.
-
-### Key Technical Achievements
-The implementation detailed in this document delivers several critical technical capabilities for both Kubernetes and OpenShift environments:
-
-**Advanced Network Integration**: By establishing eBGP peering between Cilium's native BGP control plane and ACI L3Outs, organizations achieve seamless route advertisement and traffic engineering across both Kubernetes and OpenShift platforms. The use of local-only pod CIDR advertisements with /32 route optimization ensures scalability even in clusters with thousands of nodes while minimizing BGP convergence times and reducing route table sizes.
 
 **Enterprise-Grade Security**: Cilium's eBPF-based policy enforcement combined with ACI's hardware-accelerated contract system provides defense-in-depth security at multiple layers. The integration supports L3-L7 policy enforcement, DNS-aware rules, and transparent encryption, enabling comprehensive microsegmentation and compliance with enterprise security frameworks. OpenShift's Security Context Constraints (SCCs) provide additional security layers that integrate seamlessly with Cilium's policy model.
 
 **Platform-Specific Optimizations**: 
+
 - **Kubernetes**: Full kube-proxy replacement with strict eBPF implementation for maximum performance
 - **OpenShift**: Partial kube-proxy replacement ensuring compatibility with OpenShift's integrated monitoring and service mesh capabilities
 
@@ -1761,8 +1607,6 @@ The Hubble integration provides unprecedented visibility into cluster networking
 
 ### Scalability and Future-Proofing
 The architecture scales horizontally through BGP route optimization and vertically through performance tuning. The modular design enables incremental adoption and integration with additional enterprise systems such as service mesh, storage networks, and external connectivity providers.
-
-This implementation serves as a foundation for organizations seeking to modernize their data center networking while maintaining integration with existing Cisco infrastructure investments. The documented configurations and best practices ensure reliable, secure, and high-performance networking at enterprise scale for both traditional Kubernetes and enterprise OpenShift deployments. The flexibility to choose between platforms based on organizational needs while maintaining consistent networking and security policies represents a significant advancement in hybrid cloud infrastructure design.
 
 ## References and Additional Resources
 ### Official Documentation
