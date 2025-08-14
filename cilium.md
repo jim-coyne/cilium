@@ -63,36 +63,30 @@ Cilium is an advanced CNI (Container Network Interface) for Kubernetes, providin
 
 Before deploying Kubernetes/OpenShift clusters with Cilium, the underlying infrastructure must be properly configured. This section covers the essential infrastructure components that must be deployed and configured prior to cluster installation.
 
-## ACI Fabric 
+## ACI Fabric Connectivity:
 
-### Physical Infrastructure Design
-#### Topology Requirements:
-```
-Recommended Topology:
-  Spine Switches: N9K-C9364C 
-  Leaf Switches: N9K-C93180YC-EX or newer
-  
+  - Ensure the Cisco ACI fabric is fully deployed and operational.
+  - A pair of ACI leaf switches (e.g., N9K-C93180YC-EX or newer) must be available to provide vPC connectivity for UCS Fabric Interconnects (FIs).
+  - Spine switches (e.g., N9K-C9364C) should be present as part of the fabric.
+
 Connection Standards:
-  Spine-Leaf: 100G/400G QSFP+
-  Leaf-UCS FI: 100G/400G QSFP+
-```
+  - Spine-Leaf: 100G/400G QSFP+
+  - Leaf-UCS FI: 100G/400G QSFP+
 
-- **UCS FI to ACI Leaf**: Use vPC pairs for redundancy
-- **Minimum 2x 100G connections per FI to each leaf**
-- **Cable both FIs to both leafs in vPC configuration**
+- **ACI leaf switches must be configured as a vPC pair for redundant connectivity to UCS Fabric Interconnects.**
 
 ## UCS B-Series Hardware
 
-### Physical Connectivity and Hardware Specifications
 - **Supported Platforms**: UCS B200 M5/M6, B480 M5, or newer
-- **Fabric Interconnects**: 
-  - **UCS-FI-64108**: 100G/400G QSFP28/QSFP-DD, 48 ports unified fabric (recommended)
-  - **UCS-FI-64112**: 100G/400G/800G QSFP-DD, 32 ports for highest density/performance
-  - **Legacy Support**: 6454/6536 still supported but not recommended for new deployments
-- **Network Adapters**: VIC 1455/1457 for optimal performance and SR-IOV support
-- **Memory**: DDR4-2933 or faster, minimum 128GB for production Kubernetes nodes
-- **Storage**: NVMe SSDs for etcd and container runtime, minimum 1TB per node
 
+- **Fabric Interconnects**: 
+
+  - UCS-FI-64108: 100G/400G QSFP28/QSFP-DD, 48 ports unified fabric (recommended)
+  - UCS-FI-64112: 100G/400G/800G QSFP-DD, 32 ports for highest density/performance
+  - Legacy Support: 6454/6536 still supported but not recommended for new deployments
+- Network Adapters: VIC 1455/1457 for optimal performance and SR-IOV support
+- Memory: DDR4-2933 or faster, minimum 128GB for production Kubernetes nodes
+- Storage: NVMe SSDs for etcd and container runtime, minimum 1TB per node
 
 ### Intersight Configuration
 
@@ -207,46 +201,35 @@ Network Control Policy: k8s-network-control
                WantedBy=multi-user.target
      ```
 
-### 2. **Network Infrastructure Setup**
-   - Assign static IP addresses to nodes from dedicated IPpool (node network)
-   - Ensure L3Out connectivity from node subnet to external networks via ACI fabric
-   - Plan IP addressing scheme:
+### 2. **Network Infrastructure**
 
-     - Node subnet: 10.1.0.0/24 (bridge-domain, single EPG or EPG per host with K8s contract)
+   - The computer/node network is the primary subnet used to assign static IP addresses to each Kubernetes or OpenShift node. This network is mapped to a dedicated ACI bridge domain and EPG, and is the source of BGP peering between the nodes and the ACI fabric via the L3Out. Each node receives an IP from this pool, and the subnet must be routable through the ACI L3Out to external networks.
 
-     - Pod CIDR: 10.244.0.0/16 (Kubernetes default, L3out for pod traffic)
-     - Pod CIDR: 10.128.0.0/14 (OpenShift default, L3out for pod traffic)
+     - Node subnet: 10.1.0.0/24 (Initial bridge-domain)
 
-     - Service CIDR: 10.96.0.0/12 (Kubernetes default, L3out for service traffic)
-     - Service CIDR: 172.30.0.0/16 (OpenShift default, L3out for service traffic)
+   - The Pod CIDR defines the address range used for allocating IPs to pods within the cluster. For Kubernetes, the default is 10.244.0.0/16; for OpenShift, it is 10.128.0.0/14. These CIDRs are advertised to the ACI fabric over BGP through the L3Out, allowing external networks to reach pods directly when required. Each node typically advertises its local pod subnet to reduce BGP table size and optimize routing.
 
-   - Configure DNS resolution for cluster.local domain **Important**
+     - Pod CIDR: 10.244.0.0/16 (Kubernetes default)
+     - Pod CIDR: 10.128.0.0/14 (OpenShift default)
+
+   - The Service CIDR is the address range used for Kubernetes or OpenShift services (virtual IPs for cluster services). The default for Kubernetes is 10.96.0.0/12, and for OpenShift it is 172.30.0.0/16. These CIDRs are also advertised to the ACI fabric via the L3Out, enabling external access to cluster services as needed.
+
+     - Service CIDR: 10.96.0.0/12 (Kubernetes default)
+     - Service CIDR: 172.30.0.0/16 (OpenShift default)
+
+   - All three networks (node, pod, and service) must be properly defined in ACI as bridge domains and included in the L3Out configuration. This ensures that BGP advertisements from Cilium are accepted and routed by the ACI fabric, and that external connectivity is available for both pods and services.
+
+   - Configure DNS resolution **Important**
+
+     - For Kubernetes, ensure that all nodes can resolve the cluster.local domain, which is the default DNS suffix for services and pods. This typically involves configuring CoreDNS or kube-dns as the cluster DNS service, and setting the appropriate search domains and upstream resolvers in `/etc/resolv.conf` on each node. If using custom node images or bare metal, verify that the node-level DNS configuration does not override or conflict with cluster DNS settings.
+
+     - For OpenShift, DNS resolution for the cluster.local domain is managed by the integrated DNS operator, which automatically configures CoreDNS and ensures that all nodes and pods receive the correct DNS settings. OpenShift also provides additional DNS features such as automatic DNS forwarding, DNS policy management, and integration with the OpenShift SDN. Manual DNS configuration on nodes is rarely required, but it is important to ensure that any custom MachineConfig or node-level changes do not interfere with the platform-managed DNS.
+
+     - In both platforms, correct DNS resolution is critical for service discovery, pod-to-pod communication, and the operation of many Kubernetes and OpenShift features. Misconfigured DNS can lead to application failures, connectivity issues, and degraded cluster health.
 
 ### 3. **High Availability and Node Network Configuration**
 
-Configure nodes with dual vNICs for network redundancy and implement active/backup bonding at the OS level for maximum availability.
-
-#### UCS vNIC Configuration Prerequisites:
-Before configuring OS-level bonding, ensure proper UCS vNIC setup:
-
-```yaml
-# UCS vNIC Templates (configured in Intersight)
-k8s-node-primary:
-  Fabric: A  
-  Redundancy Type: Primary
-  VLAN: 200 (Node Network - BGP Peering)
-  MTU: 9000
-  MAC Pool: k8s-node-mac-pool
-  
-k8s-node-secondary:
-  Fabric: B
-  Redundancy Type: Secondary  
-  VLAN: 200 (Node Network - BGP Peering)
-  MTU: 9000
-  MAC Pool: k8s-node-mac-pool
-```
-
-#### Active/Backup Bonding Configuration (mode=1):
+Configure nodes with dual vNICs for network redundancy and implement active/backup bonding at the OS level for maximum availability. Active/Backup Bonding Configuration (mode=1).
 
 **For Kubernetes (systemd-networkd - Recommended):**
 ```bash
@@ -387,32 +370,6 @@ spec:
           Destination=10.128.0.0/14  # OpenShift pod CIDR
           Gateway=10.1.0.1
           Metric=100
-```
-
-#### Network Performance Optimization:
-```bash
-# /etc/sysctl.d/99-kubernetes-network.conf
-# Core networking
-net.core.somaxconn = 32768
-net.core.netdev_max_backlog = 5000
-net.core.netdev_budget = 600
-
-# TCP optimization
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_probes = 3
-net.ipv4.tcp_keepalive_intvl = 90
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_slow_start_after_idle = 0
-
-# Buffer sizes
-net.core.rmem_default = 262144
-net.core.rmem_max = 134217728
-net.core.wmem_default = 262144
-net.core.wmem_max = 134217728
-
-# IPv4 routing optimization
-net.ipv4.ip_forward = 1
-net.ipv4.conf.all.forwarding = 1
 ```
 
 #### Bond Status Verification:
@@ -807,14 +764,6 @@ Route Control Subnets:
   - 0.0.0.0/0 (Default route) - import-security, shared-security
 ```
 
-#### APIC Configuration Steps:
-1. Navigate to **Tenants → k8s-prod → Networking → L3Outs**
-2. Create **k8s-l3out** with proper VRF association
-3. Configure **Logical Node Profile** with border leaf switches
-4. Set up **BGP Peer Connectivity Profile** (will be configured per-node later)
-5. Create **External EPG** with route control subnets
-6. Associate bridge domains with appropriate EPGs
-
 ## Establishing eBGP Peering
 
 With ACI L3Out infrastructure in place, the next step is to establish eBGP peering between Cilium nodes and ACI border leafs. This section covers both the Cilium configuration and the step-by-step process to bring up BGP sessions.
@@ -865,11 +814,12 @@ Ensure basic IP connectivity before establishing BGP sessions:
 
 ```bash
 # On each Kubernetes node, test connectivity to ACI border leaf SVIs
-ping 192.168.100.1  # Border leaf-101 SVI
-ping 192.168.100.5  # Border leaf-102 SVI
+
+ping 10.1.0.1  # Border leaf-101 SVI
+ping 10.1.0.5  # Border leaf-102 SVI
 
 # Verify MTU and jumbo frames if configured
-ping -M do -s 8972 192.168.100.1  # Test with 9000 MTU
+ping -M do -s 8972 10.1.0.1  # Test with 9000 MTU
 ```
 
 #### Step 2: Configure ACI BGP Peers for Each Node
