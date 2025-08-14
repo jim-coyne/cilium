@@ -614,55 +614,134 @@ Network Control Policy: k8s-network-control
    ```
 
 ## Configuring eBGP Peering with ACI L3Outs
-### 1. **ACI L3Out Detailed Configuration**
-#### APIC Configuration Steps:
-1. **Create Tenant and VRF:**
-   ```
-   Tenant: k8s-prod
-   VRF: k8s-vrf
-   Route Target: auto-generated
-   ```
 
-2. **Create L3Out:**
-   ```
-   Name: k8s-l3out
-   VRF: k8s-vrf
-   Domain: l3dom_k8s
-   BGP ASN: 65002
-   ```
+### 1. **ACI L3Out Configuration**
+Essential ACI configuration for Cilium BGP integration:
 
-3. **Configure BGP Peer Connectivity Profile:**
-   ```
-   Logical Node Profile: k8s-nodes
-   Logical Interface Profile: k8s-interfaces
-   BGP Peer Connectivity Profile:
-     - Peer IP: <each_k8s_node_ip>
-     - Remote ASN: 65001
-     - Local ASN: 65002
-     - Hold Interval: 90
-     - Keepalive Interval: 30
-     - Connection Mode: bidirectional
-   ```
+#### Create Core ACI Objects:
+```yaml
+# Tenant and VRF
+Tenant: k8s-prod
+VRF: k8s-vrf (Policy Control: enforced, Direction: ingress)
 
-4. **Create External EPG:**
-   ```
-   Name: k8s-external-epg
-   Preferred Group: enabled
-   Subnets:
-     - 10.244.0.0/16 (Kubernetes pod CIDR) - Import/Export Route Control
-     - 10.96.0.0/12 (Kubernetes service CIDR) - Import/Export Route Control
-     - 10.128.0.0/14 (OpenShift pod CIDR) - Import/Export Route Control  
-     - 172.30.0.0/16 (OpenShift service CIDR) - Import/Export Route Control
-   ```
+# L3Out
+Name: k8s-l3out
+VRF: k8s-vrf
+Domain: l3dom_k8s
+BGP ASN: 65002
 
-### 2. **Advanced Cilium BGP Configuration**
-Create a comprehensive `CiliumBGPPeeringPolicy`:
+# Logical Node Profile
+Logical Node Profile: k8s-border-leafs
+Nodes: leaf-101, leaf-102
+Router ID Loopback: enabled
+
+# BGP Peer Connectivity
+Peer IPs: <each_k8s_node_ip>
+Remote ASN: 65001 (Cilium)
+Local ASN: 65002 (ACI)
+Timers: Hold=180s, Keepalive=60s
+
+# External EPG
+Name: k8s-external-epg
+Route Control Subnets:
+  - 10.244.0.0/16 (K8s pods) - export-rtctrl
+  - 10.96.0.0/12 (K8s services) - export-rtctrl  
+  - 10.128.0.0/14 (OpenShift pods) - export-rtctrl
+  - 172.30.0.0/16 (OpenShift services) - export-rtctrl
+```
+
+### 2. **Cilium BGP Configuration**
+Configure Cilium BGP peering with streamlined policy:
 
 ```yaml
 apiVersion: cilium.io/v2alpha1
 kind: CiliumBGPPeeringPolicy
 metadata:
-  name: aci-ebgp-peering-advanced
+  name: aci-bgp-peering
+spec:
+  nodeSelector:
+    matchLabels:
+      kubernetes.io/os: linux
+  virtualRouters:
+  - localASN: 65001
+    exportPodCIDR: true
+    exportPodCIDRMode: "local:true"  # Scale optimization
+    neighbors:
+    - peerAddress: <ACI_L3OUT_SVI_IP>/32
+      peerASN: 65002
+      eBGPMultihop: 2
+      holdTimeSeconds: 180
+      keepaliveTimeSeconds: 60
+      gracefulRestart:
+        enabled: true
+        restartTimeSeconds: 300
+      advertisements:
+      - advertisementType: "PodCIDR"
+        localPreference: 100
+        communities:
+          standard: ["65001:100"]
+      - advertisementType: "Service"
+        service:
+          matchLabels:
+            advertise-via-bgp: "true"
+        localPreference: 200
+        communities:
+          standard: ["65001:200"]
+```
+
+### 3. **Establishing eBGP Connections to Each Node**
+
+#### Per-Node BGP Peering Setup
+Cilium establishes eBGP sessions from each Kubernetes node to ACI border leaf switches. This section details the step-by-step process to bring up these connections.
+
+#### Step 1: Verify Node Network Connectivity
+Before establishing BGP sessions, ensure basic IP connectivity between each node and ACI border leafs:
+
+```bash
+# On each Kubernetes node, test connectivity to ACI border leaf SVIs
+ping 192.168.100.1  # Border leaf-101 SVI
+ping 192.168.100.5  # Border leaf-102 SVI
+
+# Verify routing to border leaf loopbacks (if using loopback peering)
+ping 10.1.1.101     # Border leaf-101 loopback
+ping 10.1.1.102     # Border leaf-102 loopback
+
+# Check MTU and ensure jumbo frames if configured
+ping -M do -s 8972 192.168.100.1  # Test with 9000 MTU
+```
+
+#### Step 2: Configure ACI Border Leaf BGP Peers
+For each Kubernetes node, add a BGP peer configuration in ACI:
+
+```bash
+# ACI Border Leaf Configuration (via APIC or CLI)
+# Example for node k8s-worker-01 (IP: 10.1.0.10)
+
+# APIC GUI Path: Tenants > k8s-prod > Networking > L3Outs > k8s-l3out 
+# > Logical Node Profiles > k8s-border-leafs > BGP Peer Connectivity Profiles
+
+BGP_Peer_Configuration:
+  Peer_Address: 10.1.0.10      # Kubernetes node IP
+  Remote_ASN: 65001            # Cilium ASN
+  Local_ASN: 65002             # ACI L3Out ASN
+  Connection_Mode: bidirectional
+  Address_Family: ipv4-ucast
+  Hold_Timer: 180              # Seconds
+  Keepalive_Timer: 60          # Seconds
+  Password: <optional>         # BGP MD5 authentication
+  BFD: enabled                 # Fast failure detection
+  Send_Community: enabled      # For route tagging
+  Send_Extended_Community: enabled
+```
+
+#### Step 3: Apply Cilium BGP Configuration
+Create or update the CiliumBGPPeeringPolicy to establish sessions with each border leaf:
+
+```yaml
+apiVersion: cilium.io/v2alpha1
+kind: CiliumBGPPeeringPolicy
+metadata:
+  name: aci-node-peering
 spec:
   nodeSelector:
     matchLabels:
@@ -671,315 +750,216 @@ spec:
   - localASN: 65001
     exportPodCIDR: true
     exportPodCIDRMode: "local:true"
-    serviceSelector:
-      matchExpressions:
-      - key: somekey
-        operator: NotIn
-        values: ['never-used-value']
     neighbors:
-    - peerAddress: <ACI_L3OUT_SVI_IP>/32
+    # Peer with border leaf-101
+    - peerAddress: "192.168.100.1/32"  # Border leaf-101 SVI
       peerASN: 65002
       eBGPMultihop: 2
-      connectRetryTimeSeconds: 10
-      holdTimeSeconds: 90
-      keepaliveTimeSeconds: 30
+      holdTimeSeconds: 180
+      keepaliveTimeSeconds: 60
       gracefulRestart:
         enabled: true
-        restartTimeSeconds: 120
-      advertisements:
-      - advertisementType: "PodCIDR"
-        localPreference: 100
-        communities:
-          standard: ["65001:100"]
-      - advertisementType: "Service"
-        service:
-          matchExpressions:
-          - key: type
-            operator: In
-            values: ['LoadBalancer', 'NodePort']
-        localPreference: 200
-        communities:
-          standard: ["65001:200"]
-```
-
-### 3. **BGP Route Policies and Communities**
-Configure advanced BGP policies using `CiliumBGPAdvertisement`:
-
-```yaml
-apiVersion: cilium.io/v2alpha1
-kind: CiliumBGPAdvertisement
-metadata:
-  name: pod-cidr-advertisement
-spec:
-  advertisements:
-  - advertisementType: "PodCIDR"
-    attributes:
+        restartTimeSeconds: 300
+    # Peer with border leaf-102  
+    - peerAddress: "192.168.100.5/32"  # Border leaf-102 SVI
+      peerASN: 65002
+      eBGPMultihop: 2
+      holdTimeSeconds: 180
+      keepaliveTimeSeconds: 60
+      gracefulRestart:
+        enabled: true
+        restartTimeSeconds: 300
+    advertisements:
+    - advertisementType: "PodCIDR"
       localPreference: 100
       communities:
         standard: ["65001:100"]
-      aspath:
-        prepends: 1
-  - advertisementType: "Service"
-    selector:
-      matchLabels:
-        advertise: "bgp"
-    attributes:
+    - advertisementType: "Service"
+      service:
+        matchLabels:
+          advertise-via-bgp: "true"
       localPreference: 200
       communities:
-        standard: ["65001:200", "65001:300"]
+        standard: ["65001:200"]
 ```
 
-### 4. **Monitoring and Troubleshooting BGP Sessions**
+#### Step 4: Verify BGP Session Establishment
+Monitor BGP session establishment from both Cilium and ACI perspectives:
 
-#### For Kubernetes:
 ```bash
-# Check BGP session status
-kubectl get ciliumbgpnodeconfigs -o yaml
+# Kubernetes - Check BGP session status
+kubectl exec -n kube-system ds/cilium -- cilium bgp peers
+# Expected output: Established sessions to both border leaf SVIs
 
-# View BGP routes
+# Kubernetes - Verify route advertisements
+kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised
+# Expected: Local pod CIDR (/24) and service IPs advertised
+
+# OpenShift - Check BGP session status
+oc exec -n cilium ds/cilium-agent -- cilium bgp peers
+oc exec -n cilium ds/cilium-agent -- cilium bgp routes advertised
+```
+
+#### Step 5: ACI Side Verification
+Verify BGP sessions and received routes on ACI border leafs:
+
+```bash
+# On ACI Border Leaf (via SSH or APIC)
+# Check BGP session summary
+show bgp ipv4 unicast summary vrf k8s-vrf
+
+# Expected output example:
+# Neighbor        V    AS MsgRcvd MsgSent   TblVer  InQ OutQ Up/Down  State/PfxRcd
+# 10.1.0.10       4 65001      45      42        8    0    0 00:15:23        2
+# 10.1.0.11       4 65001      43      40        8    0    0 00:14:56        2
+
+# Check specific BGP neighbor details
+show bgp ipv4 unicast neighbors 10.1.0.10 vrf k8s-vrf
+
+# Verify received routes from Cilium nodes
+show bgp ipv4 unicast vrf k8s-vrf | include 10.244
+# Expected: Per-node pod CIDR routes (e.g., 10.244.1.0/24, 10.244.2.0/24)
+
+# Check route table entries
+show ip route vrf k8s-vrf 10.244.0.0/16
+```
+
+#### Step 6: Troubleshooting BGP Session Issues
+
+**Common Issues and Solutions:**
+
+1. **BGP Session Stuck in Active/Connect State:**
+```bash
+# Check connectivity
+kubectl exec -n kube-system ds/cilium -- cilium bgp peers
+# Look for "Active" or "Connect" state instead of "Established"
+
+# Verify ACI border leaf configuration
+show bgp ipv4 unicast neighbors 10.1.0.10 vrf k8s-vrf | include state
+```
+
+2. **ASN Mismatch:**
+```bash
+# Verify ASN configuration on both sides
+kubectl get ciliumbgppeeringpolicies -o yaml | grep -A5 -B5 ASN
+# Should show localASN: 65001, peerASN: 65002
+```
+
+3. **Timer Mismatch:**
+```bash
+# Check BGP timer alignment
+show bgp ipv4 unicast neighbors 10.1.0.10 vrf k8s-vrf | include timer
+# Hold time should be 180s, keepalive 60s on both sides
+```
+
+4. **Firewall/ACL Blocking:**
+```bash
+# Verify BGP port 179 connectivity
+kubectl exec -n kube-system ds/cilium -- netstat -tuln | grep 179
+# Should show listening on port 179
+
+# Test from node to border leaf
+telnet 192.168.100.1 179
+```
+
+#### Step 7: Validate End-to-End Connectivity
+Once BGP sessions are established, test end-to-end connectivity:
+
+```bash
+# Test pod-to-external connectivity
+kubectl run test-pod --image=busybox --rm -it -- ping 8.8.8.8
+
+# Verify service advertisement
+kubectl create service loadbalancer test-svc --tcp=80:80
+kubectl label service test-svc advertise-via-bgp=true
+
+# Check if service IP is advertised via BGP
+kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised | grep test-svc
+```
+
+#### Step 8: Production Readiness Checklist
+
+**Pre-Production Validation:**
+- [ ] All nodes have established BGP sessions to both border leafs
+- [ ] Pod CIDRs are correctly advertised as /24 subnets
+- [ ] Service IPs are advertised only from nodes with endpoints
+- [ ] BGP graceful restart is functioning during node maintenance
+- [ ] Route convergence time meets SLA requirements (<30 seconds)
+- [ ] BGP session monitoring and alerting is configured
+
+**Monitoring Commands for Production:**
+```bash
+# Continuous BGP monitoring script
+#!/bin/bash
+while true; do
+  echo "=== BGP Session Status $(date) ==="
+  kubectl exec -n kube-system ds/cilium -- cilium bgp peers | grep -E "(Peer|Established|Active)"
+  echo "=== Route Count ==="
+  kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised | wc -l
+  sleep 30
+done
+```
+
+### 4. **BGP Monitoring and Troubleshooting**
+
+#### Essential Commands:
+```bash
+# Kubernetes
+kubectl exec -n kube-system ds/cilium -- cilium bgp peers
 kubectl exec -n kube-system ds/cilium -- cilium bgp routes
 
-# Debug BGP sessions
-kubectl exec -n kube-system ds/cilium -- cilium bgp peers
-
-# Monitor route advertisements
-kubectl logs -n kube-system ds/cilium | grep bgp
-```
-
-#### For OpenShift:
-```bash
-# Check BGP session status (Cilium deployed in cilium namespace)
-oc get ciliumbgpnodeconfigs -o yaml -n cilium
-
-# View BGP routes from Cilium pods
+# OpenShift  
+oc exec -n cilium ds/cilium-agent -- cilium bgp peers
 oc exec -n cilium ds/cilium-agent -- cilium bgp routes
 
-# Debug BGP sessions
-oc exec -n cilium ds/cilium-agent -- cilium bgp peers
-
-# Monitor route advertisements using OpenShift logging
-oc logs -n cilium ds/cilium-agent | grep bgp
-
-# Check Cilium configuration via ConfigMap
-oc get cm cilium-config -n cilium -o yaml
-
-# Verify node readiness and BGP peer status
-oc describe nodes | grep -A5 -B5 "Network Unavailable"
+# ACI APIC/Border Leaf
+show bgp ipv4 unicast summary vrf k8s-vrf
+show ip route vrf k8s-vrf 10.244.0.0/16
 ```
 
-#### OpenShift Monitoring Integration:
-```yaml
-# Create ServiceMonitor for Cilium metrics in OpenShift
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: cilium-agent
-  namespace: cilium
-spec:
-  endpoints:
-  - interval: 30s
-    path: /metrics
-    port: prometheus
-    scheme: http
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: cilium-agent
-```
+### 4. **Pod and Service CIDR Advertisement**
 
-### 3. **Advanced Pod and Service CIDR Advertisement**
-#### Pod CIDR Advertisement Configuration:
-Cilium advertises pod networks using two different modes:
+#### Advertisement Modes:
+- **exportPodCIDRMode: "local:true"**: Each node advertises only its allocated pod subnet (/24 from cluster /16)
+  - Benefits: Reduces BGP table size, improves convergence, enables traffic engineering
+- **Service Advertisement**: Controlled by `externalTrafficPolicy` setting
+  - **Local**: Only nodes with pods advertise service IP as /32 (recommended for performance)
+  - **Cluster**: All nodes advertise entire service CIDR
 
-**exportPodCIDRMode Settings:**
-- `exportPodCIDRMode: "local:true"`: Each node advertises only its own allocated pod subnet (/24 from /16 cluster CIDR)
-  - Example: Node1 advertises 10.244.1.0/24, Node2 advertises 10.244.2.0/24
-  - Benefits: Reduces BGP table size, improves convergence time, enables per-node traffic engineering
-- `exportPodCIDRMode: "false"` (default): All nodes advertise the entire cluster pod CIDR
-  - Example: All nodes advertise 10.244.0.0/16
-
-#### Service Advertisement Configuration:
-Service advertisement behavior depends on `externalTrafficPolicy` and load balancer configuration:
-
-**Local Traffic Policy (Recommended for Performance):**
+#### Example Service Configuration:
 ```yaml
 apiVersion: v1
 kind: Service
 metadata:
   name: web-service
-  annotations:
-    service.cilium.io/lb-ipam-ips: "10.96.100.1"  # Optional: specific IP
+  labels:
+    advertise-via-bgp: "true"  # Required for BGP advertisement
 spec:
   type: LoadBalancer
-  externalTrafficPolicy: Local  # Only nodes with pods advertise service IP as /32
+  externalTrafficPolicy: Local  # Direct routing to pod nodes
   selector:
     app: web
   ports:
   - port: 80
     targetPort: 8080
----
-# BGP advertisement behavior:
-# - Nodes WITH web pods: Advertise 10.96.100.1/32
-# - Nodes WITHOUT web pods: Do not advertise this service IP
-# - Result: Traffic goes directly to nodes with endpoints, no kube-proxy forwarding
 ```
 
-**Cluster Traffic Policy (Default):**
+### 5. **Required Bridge Domains**
+Create bridge domains in ACI for Kubernetes networks:
+
 ```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: web-service-cluster
-spec:
-  type: LoadBalancer
-  externalTrafficPolicy: Cluster  # All nodes advertise entire service subnet
-  selector:
-    app: web
-  ports:
-  - port: 80
-    targetPort: 8080
----
-# BGP advertisement behavior:
-# - All nodes: Advertise entire service CIDR (e.g., 10.96.0.0/12)
-# - Result: Traffic can land on any node, kube-proxy forwards to endpoints
-```
+# Required Bridge Domains
+k8s-nodes-bd: 10.1.0.0/24 (Node network)
+k8s-pods-bd: 10.244.0.0/16 (K8s pods) 
+k8s-services-bd: 10.96.0.0/12 (K8s services)
+openshift-pods-bd: 10.128.0.0/14 (OpenShift pods)
+openshift-services-bd: 172.30.0.0/16 (OpenShift services)
 
-**Advanced BGP Service Advertisement Control:**
-```yaml
-apiVersion: cilium.io/v2alpha1
-kind: CiliumBGPAdvertisement
-metadata:
-  name: selective-service-advertisement
-spec:
-  advertisements:
-  - advertisementType: "Service"
-    service:
-      matchLabels:
-        advertise-via-bgp: "true"  # Only advertise services with this label
-    attributes:
-      localPreference: 200
-      communities:
-        standard: ["65001:service"]
-```
-
-#### IPAM Pool Configuration:
-
-#### For Kubernetes:
-```yaml
-apiVersion: "cilium.io/v2alpha1"
-kind: CiliumPodIPPool
-metadata:
-  name: pool-blue
-spec:
-  ipv4:
-    cidrs:
-    - 10.244.0.0/18
-    maskSize: 24
-  allocator: "cluster"
-```
-
-#### For OpenShift:
-```yaml
-apiVersion: "cilium.io/v2alpha1"
-kind: CiliumPodIPPool
-metadata:
-  name: openshift-pool
-spec:
-  ipv4:
-    cidrs:
-    - 10.128.0.0/16  # OpenShift default pod CIDR
-    maskSize: 23      # OpenShift default node allocation
-  allocator: "cluster"
-```
-
-### 4. **Bridge Domain Configuration in ACI**
-#### Detailed BD Setup:
-
-#### For Kubernetes:
-1. **Create Bridge Domain:**
-   ```
-   Name: k8s-pod-bd
-   VRF: k8s-vrf
-   Subnet: 10.244.0.0/16
-   Scope: Public
-   Subnet Control: Querier IP
-   ```
-
-#### For OpenShift:
-1. **Create Bridge Domain:**
-   ```
-   Name: openshift-pod-bd
-   VRF: k8s-vrf
-   Subnet: 10.128.0.0/14
-   Scope: Public
-   Subnet Control: Querier IP
-   ```
-
-2. **Advanced BD Settings (Common):**
-   ```
-   ARP Flooding: Enabled
-   Unknown Unicast: Proxy
-   Unicast Routing: Enabled
-   IGMP Snooping: Enabled
-   MLD Snooping: Enabled (if IPv6)
-   ```
-
-3. **Associate with L3Out:**
-   ```
-   L3Out: k8s-l3out
-   External EPG: k8s-external-epg
-   Route Control: Import/Export
-   ```
-
-### 5. **Enterprise-Scale BGP Optimization**
-#### Route Summarization:
-
-#### For Kubernetes:
-```bash
-# Configure route aggregation in ACI
-# APIC GUI: L3Out > Route Summarization
-# Aggregate pod routes: 10.244.0.0/16
-# Aggregate service routes: 10.96.0.0/12
-```
-
-#### For OpenShift:
-```bash
-# Configure route aggregation in ACI for OpenShift
-# APIC GUI: L3Out > Route Summarization
-# Aggregate pod routes: 10.128.0.0/14
-# Aggregate service routes: 172.30.0.0/16
-```
-
-#### BGP Timer Optimization:
-```yaml
-# Optimized BGP timers for large scale
-neighbors:
-- peerAddress: 10.1.1.1/32
-  peerASN: 65002
-  holdTimeSeconds: 180    # Increased for stability
-  keepaliveTimeSeconds: 60 # Increased interval
-  connectRetryTimeSeconds: 30
-  gracefulRestart:
-    enabled: true
-    restartTimeSeconds: 300
-```
-
-#### Route Filtering and Policies:
-```yaml
-# Route filtering based on communities
-apiVersion: cilium.io/v2alpha1
-kind: CiliumBGPAdvertisement
-metadata:
-  name: selective-advertisement
-spec:
-  advertisements:
-  - advertisementType: "PodCIDR"
-    attributes:
-      communities:
-        standard: ["65001:prod"]
-      localPreference: 150
-    selector:
-      matchLabels:
-        environment: "production"
+# Bridge Domain Settings (for all)
+VRF: k8s-vrf
+ARP Flooding: enabled
+Unicast Routing: enabled
+Scope: Public, Shared
 ```
 
 ## Advanced ACI L3Out Best Practices and Optimization
@@ -1501,594 +1481,21 @@ Network Control Policy: k8s-network-control
 
 ### Detailed ACI Configuration for Kubernetes Integration
 
-ACI configuration for Kubernetes integration requires careful planning of tenants, VRFs, bridge domains, and L3Outs. The following sections outline the manual configuration steps or can be automated using infrastructure as code tools.
+For manual ACI configuration or infrastructure as code automation, create the following objects in APIC:
 
-#### Manual ACI Configuration Overview:
+#### Essential ACI Objects:
+1. **Tenant and VRF**: k8s-prod tenant with k8s-vrf (policy control enforced)
+2. **L3Out**: k8s-l3out with BGP ASN 65002, associated with k8s-vrf
+3. **Border Leaf Configuration**: BGP peers on leaf-101/102 with Router ID loopback
+4. **External EPG**: k8s-external-epg with route control subnets for pod/service CIDRs
+5. **Bridge Domains**: Create BDs for node, pod, and service networks with proper scoping
 
-```yaml
-Tenant Structure:
-variable "apic_username" {
-  description = "APIC Username"
-  type        = string
-}
+#### Key Configuration Parameters:
+- **BGP Timers**: Hold=180s, Keepalive=60s (production recommended)
+- **Route Control**: Export-only for pod/service CIDRs, import for management networks
+- **VRF Policy**: Ingress policy control with enforced direction
+- **External EPG Subnets**: Use export-rtctrl scope for Kubernetes networks
 
-variable "apic_password" {
-  description = "APIC Password"
-  type        = string
-  sensitive   = true
-}
-
-variable "apic_url" {
-  description = "APIC URL"
-  type        = string
-}
-
-variable "tenant_name" {
-  description = "ACI Tenant Name"
-  type        = string
-  default     = "K8s-Production"
-}
-
-# Create Tenant
-resource "aci_tenant" "k8s_tenant" {
-  name        = var.tenant_name
-  description = "Kubernetes Production Tenant"
-  
-  annotation = "orchestrator:terraform"
-}
-
-# Create VRF
-resource "aci_vrf" "k8s_vrf" {
-  tenant_dn   = aci_tenant.k8s_tenant.id
-  name        = "k8s-overlay-vrf"
-  description = "Kubernetes Overlay VRF"
-  
-  pc_enf_pref = "enforced"
-  pc_enf_dir  = "ingress"
-}
-
-# Create Bridge Domain for Node Network
-resource "aci_bridge_domain" "k8s_nodes_bd" {
-  tenant_dn          = aci_tenant.k8s_tenant.id
-  name               = "k8s-nodes-bd"
-  description        = "Kubernetes Nodes Bridge Domain"
-  relation_fv_rs_ctx = aci_vrf.k8s_vrf.id
-  
-  mac                = "00:22:BD:F8:19:FF"
-  arp_flood          = "yes"
-  unicast_route      = "yes"
-  unk_mac_ucast_act  = "proxy"
-  unk_mcast_act      = "flood"
-  multi_dst_pkt_act  = "bd-flood"
-}
-
-# Create Subnet for Node Network
-resource "aci_subnet" "k8s_nodes_subnet" {
-  parent_dn = aci_bridge_domain.k8s_nodes_bd.id
-  ip        = "10.1.0.1/24"
-  scope     = ["public", "shared"]
-  description = "Kubernetes Nodes Subnet"
-  
-  ctrl = ["querier"]
-  preferred = "yes"
-}
-
-# Create Bridge Domain for Kubernetes Pods
-resource "aci_bridge_domain" "k8s_pods_bd" {
-  tenant_dn          = aci_tenant.k8s_tenant.id
-  name               = "k8s-pods-bd"
-  description        = "Kubernetes Pods Bridge Domain"
-  relation_fv_rs_ctx = aci_vrf.k8s_vrf.id
-  
-  mac                = "00:22:BD:F8:19:FE"
-  arp_flood          = "yes"
-  unicast_route      = "yes"
-  unk_mac_ucast_act  = "proxy"
-  unk_mcast_act      = "flood"
-  multi_dst_pkt_act  = "bd-flood"
-}
-
-# Create Subnet for Kubernetes Pods
-resource "aci_subnet" "k8s_pods_subnet" {
-  parent_dn = aci_bridge_domain.k8s_pods_bd.id
-  ip        = "10.244.0.1/16"
-  scope     = ["public", "shared"]
-  description = "Kubernetes Pods Subnet"
-  
-  ctrl = ["querier"]
-  preferred = "yes"
-}
-
-# Create Bridge Domain for OpenShift Pods
-resource "aci_bridge_domain" "openshift_pods_bd" {
-  tenant_dn          = aci_tenant.k8s_tenant.id
-  name               = "openshift-pods-bd"
-  description        = "OpenShift Pods Bridge Domain"
-  relation_fv_rs_ctx = aci_vrf.k8s_vrf.id
-  
-  mac                = "00:22:BD:F8:19:FD"
-  arp_flood          = "yes"
-  unicast_route      = "yes"
-  unk_mac_ucast_act  = "proxy"
-  unk_mcast_act      = "flood"
-  multi_dst_pkt_act  = "bd-flood"
-}
-
-# Create Subnet for OpenShift Pods
-resource "aci_subnet" "openshift_pods_subnet" {
-  parent_dn = aci_bridge_domain.openshift_pods_bd.id
-  ip        = "10.128.0.1/14"
-  scope     = ["public", "shared"]
-  description = "OpenShift Pods Subnet"
-  
-  ctrl = ["querier"]
-  preferred = "yes"
-}
-
-# Create Bridge Domain for Kubernetes Services
-resource "aci_bridge_domain" "k8s_services_bd" {
-  tenant_dn          = aci_tenant.k8s_tenant.id
-  name               = "k8s-services-bd"
-  description        = "Kubernetes Services Bridge Domain"
-  relation_fv_rs_ctx = aci_vrf.k8s_vrf.id
-  
-  mac                = "00:22:BD:F8:19:FC"
-  arp_flood          = "yes"
-  unicast_route      = "yes"
-  unk_mac_ucast_act  = "proxy"
-  unk_mcast_act      = "flood"
-  multi_dst_pkt_act  = "bd-flood"
-}
-
-# Create Subnet for Kubernetes Services
-resource "aci_subnet" "k8s_services_subnet" {
-  parent_dn = aci_bridge_domain.k8s_services_bd.id
-  ip        = "10.96.0.1/12"
-  scope     = ["public", "shared"]
-  description = "Kubernetes Services Subnet"
-  
-  ctrl = ["querier"]
-  preferred = "yes"
-}
-
-# Create Bridge Domain for OpenShift Services
-resource "aci_bridge_domain" "openshift_services_bd" {
-  tenant_dn          = aci_tenant.k8s_tenant.id
-  name               = "openshift-services-bd"
-  description        = "OpenShift Services Bridge Domain"
-  relation_fv_rs_ctx = aci_vrf.k8s_vrf.id
-  
-  mac                = "00:22:BD:F8:19:FB"
-  arp_flood          = "yes"
-  unicast_route      = "yes"
-  unk_mac_ucast_act  = "proxy"
-  unk_mcast_act      = "flood"
-  multi_dst_pkt_act  = "bd-flood"
-}
-
-# Create Subnet for OpenShift Services
-resource "aci_subnet" "openshift_services_subnet" {
-  parent_dn = aci_bridge_domain.openshift_services_bd.id
-  ip        = "172.30.0.1/16"
-  scope     = ["public", "shared"]
-  description = "OpenShift Services Subnet"
-  
-  ctrl = ["querier"]
-  preferred = "yes"
-}
-
-# Create L3Out Domain
-resource "aci_l3_domain_profile" "l3dom_external" {
-  name        = "l3dom_external"
-  description = "L3 Domain for external connectivity"
-  
-  annotation = "orchestrator:terraform"
-}
-
-# Create L3Out
-resource "aci_l3_outside" "k8s_external_l3out" {
-  tenant_dn      = aci_tenant.k8s_tenant.id
-  name           = "k8s-external-l3out"
-  description    = "Kubernetes External L3Out"
-  relation_l3ext_rs_ectx = aci_vrf.k8s_vrf.id
-  relation_l3ext_rs_l3_dom_att = aci_l3_domain_profile.l3dom_external.id
-  
-  target_dscp = "unspecified"
-  annotation  = "orchestrator:terraform"
-}
-
-# Create Logical Node Profile
-resource "aci_logical_node_profile" "k8s_node_profile" {
-  l3_outside_dn = aci_l3_outside.k8s_external_l3out.id
-  name          = "k8s-border-leafs"
-  description   = "Logical node profile for border leafs"
-  
-  annotation = "orchestrator:terraform"
-}
-
-# Create Logical Node
-resource "aci_logical_node_to_fabric_node" "leaf_101" {
-  logical_node_profile_dn = aci_logical_node_profile.k8s_node_profile.id
-  tdn                     = "topology/pod-1/node-101"
-  rtr_id                  = "10.1.1.101"
-  rtr_id_loop_back       = "yes"
-  
-  annotation = "orchestrator:terraform"
-}
-
-resource "aci_logical_node_to_fabric_node" "leaf_102" {
-  logical_node_profile_dn = aci_logical_node_profile.k8s_node_profile.id
-  tdn                     = "topology/pod-1/node-102"
-  rtr_id                  = "10.1.1.102"
-  rtr_id_loop_back       = "yes"
-  
-  annotation = "orchestrator:terraform"
-}
-
-# Create Logical Interface Profile
-resource "aci_logical_interface_profile" "k8s_interface_profile" {
-  logical_node_profile_dn = aci_logical_node_profile.k8s_node_profile.id
-  name                    = "k8s-external-interfaces"
-  description             = "Logical interface profile for external connectivity"
-  
-  annotation = "orchestrator:terraform"
-}
-
-# Create SVI Interface
-resource "aci_l3out_path_attachment" "svi_interface_101" {
-  logical_interface_profile_dn = aci_logical_interface_profile.k8s_interface_profile.id
-  target_dn                    = "topology/pod-1/node-101/sys/ctx-[vxlan-2097152]/any/node-101/any/vlan-[vlan-100]"
-  if_inst_t                    = "ext-svi"
-  addr                         = "192.168.100.1/30"
-  encap                        = "vlan-100"
-  mode                         = "regular"
-  mtu                          = "9000"
-  
-  annotation = "orchestrator:terraform"
-}
-
-resource "aci_l3out_path_attachment" "svi_interface_102" {
-  logical_interface_profile_dn = aci_logical_interface_profile.k8s_interface_profile.id
-  target_dn                    = "topology/pod-1/node-102/sys/ctx-[vxlan-2097152]/any/node-102/any/vlan-[vlan-100]"
-  if_inst_t                    = "ext-svi"
-  addr                         = "192.168.100.5/30"
-  encap                        = "vlan-100"
-  mode                         = "regular"
-  mtu                          = "9000"
-  
-  annotation = "orchestrator:terraform"
-}
-
-# Create BGP Peer
-resource "aci_bgp_peer_connectivity_profile" "external_bgp_peer_101" {
-  logical_node_profile_dn = aci_logical_node_profile.k8s_node_profile.id
-  addr                    = "192.168.100.2"
-  addr_t_ctrl             = "af-ucast"
-  allowed_self_as_cnt     = "3"
-  annotation              = "orchestrator:terraform"
-  as_number               = "65000"
-  ctrl                    = ["send-com", "send-ext-com"]
-  name_alias              = "external-router-101"
-  peer_ctrl               = ["bfd"]
-  private_a_sctrl         = ["remove-all", "remove-exclusive"]
-  ttl                     = "1"
-  weight                  = "0"
-  
-  local_as_number         = "65002"
-  local_as_number_config  = "dual-as"
-}
-
-resource "aci_bgp_peer_connectivity_profile" "external_bgp_peer_102" {
-  logical_node_profile_dn = aci_logical_node_profile.k8s_node_profile.id
-  addr                    = "192.168.100.6"
-  addr_t_ctrl             = "af-ucast"
-  allowed_self_as_cnt     = "3"
-  annotation              = "orchestrator:terraform"
-  as_number               = "65000"
-  ctrl                    = ["send-com", "send-ext-com"]
-  name_alias              = "external-router-102"
-  peer_ctrl               = ["bfd"]
-  private_a_sctrl         = ["remove-all", "remove-exclusive"]
-  ttl                     = "1"
-  weight                  = "0"
-  
-  local_as_number         = "65002"
-  local_as_number_config  = "dual-as"
-}
-
-# Create External EPG
-resource "aci_external_network_instance_profile" "k8s_external_epg" {
-  l3_outside_dn       = aci_l3_outside.k8s_external_l3out.id
-  name                = "k8s-external-epg"
-  description         = "External EPG for Kubernetes networks"
-  exception_tag       = "0"
-  flood_on_encap      = "disabled"
-  match_t             = "AtleastOne"
-  name_alias          = "k8s-ext-epg"
-  pref_gr_memb        = "include"
-  prio                = "unspecified"
-  target_dscp         = "unspecified"
-  
-  annotation = "orchestrator:terraform"
-}
-
-# Create External Subnets for route control
-resource "aci_l3_ext_subnet" "default_route" {
-  external_network_instance_profile_dn = aci_external_network_instance_profile.k8s_external_epg.id
-  ip                                   = "0.0.0.0/0"
-  scope                               = ["import-security", "shared-security"]
-  
-  annotation = "orchestrator:terraform"
-}
-
-resource "aci_l3_ext_subnet" "k8s_pods_export" {
-  external_network_instance_profile_dn = aci_external_network_instance_profile.k8s_external_epg.id
-  ip                                   = "10.244.0.0/16"
-  scope                               = ["export-rtctrl", "shared-rtctrl"]
-  
-  annotation = "orchestrator:terraform"
-}
-
-resource "aci_l3_ext_subnet" "k8s_services_export" {
-  external_network_instance_profile_dn = aci_external_network_instance_profile.k8s_external_epg.id
-  ip                                   = "10.96.0.0/12"
-  scope                               = ["export-rtctrl", "shared-rtctrl"]
-  
-  annotation = "orchestrator:terraform"
-}
-
-resource "aci_l3_ext_subnet" "openshift_pods_export" {
-  external_network_instance_profile_dn = aci_external_network_instance_profile.k8s_external_epg.id
-  ip                                   = "10.128.0.0/14"
-  scope                               = ["export-rtctrl", "shared-rtctrl"]
-  
-  annotation = "orchestrator:terraform"
-}
-
-resource "aci_l3_ext_subnet" "openshift_services_export" {
-  external_network_instance_profile_dn = aci_external_network_instance_profile.k8s_external_epg.id
-  ip                                   = "172.30.0.0/16"
-  scope                               = ["export-rtctrl", "shared-rtctrl"]
-  
-  annotation = "orchestrator:terraform"
-}
-
-# Create Contracts
-resource "aci_contract" "k8s_internal_contract" {
-  tenant_dn   = aci_tenant.k8s_tenant.id
-  name        = "k8s-internal-contract"
-  description = "Internal communication contract for Kubernetes"
-  scope       = "tenant"
-  
-  annotation = "orchestrator:terraform"
-}
-
-resource "aci_contract_subject" "k8s_internal_subject" {
-  contract_dn   = aci_contract.k8s_internal_contract.id
-  name          = "any-to-any"
-  description   = "Allow any to any communication"
-  cons_match_t  = "AtleastOne"
-  prov_match_t  = "AtleastOne"
-  prio          = "unspecified"
-  rev_flt_ports = "yes"
-  target_dscp   = "unspecified"
-  
-  annotation = "orchestrator:terraform"
-}
-
-# Create Filter for permit all
-resource "aci_filter" "permit_all" {
-  tenant_dn   = aci_tenant.k8s_tenant.id
-  name        = "permit-all"
-  description = "Permit all traffic filter"
-  
-  annotation = "orchestrator:terraform"
-}
-
-resource "aci_filter_entry" "permit_all_entry" {
-  filter_dn   = aci_filter.permit_all.id
-  name        = "permit-all"
-  description = "Permit all traffic"
-  ether_t     = "unspecified"
-  prot        = "unspecified"
-  
-  annotation = "orchestrator:terraform"
-}
-
-# Associate filter with contract subject
-resource "aci_contract_subject_filter" "k8s_internal_filter" {
-  contract_subject_dn = aci_contract_subject.k8s_internal_subject.id
-  filter_dn          = aci_filter.permit_all.id
-  action             = "permit"
-  directives         = ["none"]
-  priority_override  = "default"
-  
-  annotation = "orchestrator:terraform"
-}
-
-# Output values
-output "tenant_dn" {
-  description = "Distinguished name of the created tenant"
-  value       = aci_tenant.k8s_tenant.id
-}
-
-output "vrf_dn" {
-  description = "Distinguished name of the created VRF"
-  value       = aci_vrf.k8s_vrf.id
-}
-
-output "l3out_dn" {
-  description = "Distinguished name of the created L3Out"
-  value       = aci_l3_outside.k8s_external_l3out.id
-}
-
-output "external_epg_dn" {
-  description = "Distinguished name of the external EPG"
-  value       = aci_external_network_instance_profile.k8s_external_epg.id
-}
-```
-
-**ACI Terraform Variables:**
-```hcl
-# terraform/aci/terraform.tfvars.example
-apic_username = "admin"
-apic_password = "your-password-here"
-apic_url      = "https://apic.example.com"
-tenant_name   = "K8s-Production"
-```
-
-**ACI Terraform Deployment:**
-```bash
-# Initialize and deploy ACI configuration
-cd terraform/aci
-terraform init
-terraform plan -var-file="terraform.tfvars"
-terraform apply -var-file="terraform.tfvars"
-```
-```yaml
-Tenant Structure:
-  Tenant: K8s-Production
-    VRF: k8s-overlay-vrf
-      Route Target: auto
-      Policy Control Direction: ingress
-      Policy Control Preference: enforced
-      
-    VRF: k8s-management-vrf  
-      Route Target: auto
-      Policy Control Direction: ingress
-      
-Bridge Domains:
-  k8s-nodes-bd:
-    VRF: k8s-overlay-vrf
-    Subnet: 10.1.0.0/24
-    Gateway: 10.1.0.1
-    Scope: Public, Shared
-    
-  k8s-pods-bd:
-    VRF: k8s-overlay-vrf  
-    Subnet: 10.244.0.0/16  # Kubernetes default
-    Gateway: 10.244.0.1
-    Scope: Public, Shared
-    
-  openshift-pods-bd:
-    VRF: k8s-overlay-vrf
-    Subnet: 10.128.0.0/14  # OpenShift default
-    Gateway: 10.128.0.1
-    Scope: Public, Shared
-    
-  k8s-services-bd:
-    VRF: k8s-overlay-vrf
-    Subnet: 10.96.0.0/12   # Kubernetes services
-    Gateway: 10.96.0.1
-    Scope: Public, Shared
-    
-  openshift-services-bd:
-    VRF: k8s-overlay-vrf
-    Subnet: 172.30.0.0/16  # OpenShift services
-    Gateway: 172.30.0.1
-    Scope: Public, Shared
-```
-
-#### 2. **Advanced L3Out Configuration**
-```yaml
-L3Out: k8s-external-l3out
-  VRF: k8s-overlay-vrf
-  Domain: l3dom_external
-  
-  Logical Node Profile: k8s-border-leafs
-    Nodes: leaf-101, leaf-102
-    Router ID Loopback: Yes
-    
-  Logical Interface Profile: k8s-external-interfaces
-    SVI Configuration:
-      Interface: vlan-100
-      IP: 192.168.100.1/30 (leaf-101)
-      IP: 192.168.100.5/30 (leaf-102)  
-      MTU: 9000
-      
-  BGP Peer Configuration:
-    Peer IP: 192.168.100.2 (External Router A)
-    Peer IP: 192.168.100.6 (External Router B)
-    Remote ASN: 65000
-    Local ASN: 65002
-    
-  External EPG: k8s-external-networks
-    Subnets:
-      - 0.0.0.0/0 (Default Route)
-      - 10.244.0.0/16 (Kubernetes Pod Networks - Export)
-      - 10.96.0.0/12 (Kubernetes Service Networks - Export)
-      - 10.128.0.0/14 (OpenShift Pod Networks - Export)
-      - 172.30.0.0/16 (OpenShift Service Networks - Export)
-```
-
-### Quality of Service and Traffic Engineering
-#### 1. **QoS Configuration**
-```yaml
-QoS Classes:
-  Level1 (Control Plane):
-    Priority: 6
-    Weight: 7
-    BW Percent: 20
-    
-  Level2 (Data Plane):  
-    Priority: 5
-    Weight: 6
-    BW Percent: 60
-    
-  Level3 (Best Effort):
-    Priority: 1
-    Weight: 1
-    BW Percent: 20
-```
-
-#### 2. **Contract and Security Policy**
-```yaml
-Contracts:
-  k8s-internal-contract:
-    Subjects:
-      - any-to-any:
-          Filters: permit-all
-          Direction: bidirectional
-          
-  k8s-external-contract:
-    Subjects:
-      - web-traffic:
-          Filters: https, http
-          Direction: bidirectional
-      - ssh-management:
-          Filters: ssh
-          Direction: ingress
-```
-
-### Monitoring and Troubleshooting
-#### 1. **APIC Monitoring Configuration**
-```bash
-# Enable fabric monitoring
-apic1# configure
-apic1(config)# monitoring policy default
-apic1(config-monitoring)# collection interval 60
-apic1(config-monitoring)# retention-policy 30days
-
-# BGP session monitoring
-apic1# show bgp ipv4 unicast summary vrf k8s-overlay-vrf
-apic1# show bgp ipv4 unicast neighbors <peer-ip> vrf k8s-overlay-vrf
-```
-
-#### 2. **Performance Baselines**
-```yaml
-Key Metrics to Monitor:
-  - BGP session state and route count
-  - Leaf switch CPU and memory utilization  
-  - Interface utilization and error rates
-  - Contract hit counters
-  - Endpoint learning and aging rates
-  
-Alerting Thresholds:
-  - BGP session down: Immediate
-  - Interface utilization > 80%: Warning
-  - Error rate > 0.01%: Warning
-  - Contract drops > 100/min: Critical
-```
 
 ## Advanced Kubernetes and OpenShift Node Network Configuration
 ### 1. **Enterprise-Grade Network Bonding Configuration**
