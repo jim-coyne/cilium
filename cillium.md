@@ -31,7 +31,7 @@
 ---
 
 ## Introduction
-This document provides a comprehensive guide to deploying Cilium as a CNI on Kubernetes and OpenShift Container Platform (OCP), establishing eBGP peering with Cisco ACI L3Outs, advertising pod and service CIDRs, and integrating with UCS B-Series. It covers advanced topics such as scale optimization, firewalling, and high-availability node networking.
+This document provides a comprehensive guide to deploying Cilium as a CNI on Kubernetes and OpenShift Container Platform (OCP), establishing eBGP peering with Cisco ACI L3Outs, advertising pod and service CIDRs. It covers advanced topics such as scale optimization, firewalling, and high-availability node networking.
 
 The guide addresses both vanilla Kubernetes and OpenShift deployments, highlighting the differences in configuration, security contexts, and operational procedures. OpenShift's enterprise-focused features such as Security Context Constraints (SCCs), operators, and integrated monitoring are covered alongside traditional Kubernetes approaches.
 
@@ -1129,35 +1129,6 @@ while true; do
   sleep 30
 done
 ```
-
-#### Common Troubleshooting Issues:
-
-1. **Routes Not Being Advertised:**
-   - Verify `exportPodCIDR: true` in BGP policy
-   - Check service labels for `advertise-via-bgp: "true"`
-   - Confirm BGP sessions are in "Established" state
-
-2. **Partial Route Advertisement:**
-   - Check `exportPodCIDRMode` setting
-   - Verify all nodes have BGP sessions established
-   - Review ACI External EPG route control subnets
-
-3. **Route Black Holes:**
-   - Verify bridge domain associations in ACI
-   - Check ACI route table entries match advertised routes
-   - Confirm proper next-hop reachability
-```bash
-# Kubernetes
-kubectl exec -n kube-system ds/cilium -- cilium bgp peers
-kubectl exec -n kube-system ds/cilium -- cilium bgp routes
-
-# OpenShift  
-oc exec -n cilium ds/cilium-agent -- cilium bgp peers
-oc exec -n cilium ds/cilium-agent -- cilium bgp routes
-
-# ACI APIC/Border Leaf
-show bgp ipv4 unicast summary vrf k8s-vrf
-
 
 ## Advanced ACI L3Out Best Practices and Optimization
 
