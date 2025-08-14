@@ -1,4 +1,4 @@
-# Deploying Cilium with eBGP Peering to Cisco ACI L3Outs: A Comprehensive Guide
+# Deploying Cilium with eBGP Peering to Cisco ACI
 
 ## Table of Contents
 1. [Introduction](#introduction)
