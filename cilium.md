@@ -2,36 +2,57 @@
 
 ## Table of Contents
 1. [Introduction](#introduction)
-2. [Prerequisites](#prerequisites)
-3. [Cilium Overview](#cilium-overview)
-4. [Infrastructure Prerequisites](#infrastructure-prerequisites)
-    - [UCS B-Series Configuration](#ucs-b-series-configuration)
-    - [ACI Fabric Integration Architecture](#aci-fabric-integration-architecture)
-5. [Kubernetes and OpenShift Cluster Preparation](#kubernetes-and-openshift-cluster-preparation)
+2. [Cilium Overview](#cilium-overview)
+    - [Core Technologies](#core-technologies)
+    - [Architecture Components](#architecture-components)
+    - [Key Features for ACI Integration](#key-features-for-aci-integration)
+3. [Infrastructure Prerequisites](#infrastructure-prerequisites)
+    - [ACI Fabric Connectivity](#aci-fabric-connectivity)
+    - [UCS B-Series Hardware](#ucs-b-series-hardware)
+    - [Intersight Configuration](#intersight-configuration)
+4. [Kubernetes and OpenShift Cluster Preparation](#kubernetes-and-openshift-cluster-preparation)
     - [Node Provisioning and OS Configuration](#node-provisioning-and-os-configuration)
-    - [Network Infrastructure Setup](#network-infrastructure-setup)
+    - [Network Infrastructure](#network-infrastructure)
     - [High Availability and Node Network Configuration](#high-availability-and-node-network-configuration)
-6. [Installing Cilium on Kubernetes](#installing-cilium-on-kubernetes)
-7. [ACI L3Out Configuration](#aci-l3out-configuration)
+5. [Installing Cilium on Kubernetes and OpenShift](#installing-cilium-on-kubernetes-and-openshift)
+    - [Prerequisites Verification](#prerequisites-verification)
+    - [Install Cilium CLI and Hubble](#install-cilium-cli-and-hubble)
+    - [Advanced Cilium Installation with BGP Support](#advanced-cilium-installation-with-bgp-support)
+    - [Configuration Parameters Explained](#configuration-parameters-explained)
+    - [Post-Installation Verification](#post-installation-verification)
+6. [ACI L3Out Configuration](#aci-l3out-configuration)
     - [Creating Core ACI Objects](#creating-core-aci-objects)
     - [Bridge Domain Configuration](#bridge-domain-configuration)
     - [External EPG and Route Control](#external-epg-and-route-control)
-8. [Establishing eBGP Peering](#establishing-ebgp-peering)
+7. [Establishing eBGP Peering](#establishing-ebgp-peering)
     - [Cilium BGP Configuration](#cilium-bgp-configuration)
     - [Per-Node BGP Session Setup](#per-node-bgp-session-setup)
     - [BGP Session Verification](#bgp-session-verification)
-9. [BGP Route Advertisements](#bgp-route-advertisements)
+8. [BGP Route Advertisements](#bgp-route-advertisements)
     - [Pod CIDR Advertisement](#pod-cidr-advertisement)
     - [Service CIDR Advertisement](#service-cidr-advertisement)
     - [Route Monitoring and Troubleshooting](#route-monitoring-and-troubleshooting)
-8. [Firewalling with Cilium](#firewalling-with-cilium)
-9. [Conclusion](#conclusion)
-10. [References](#references)
+9. [Advanced ACI L3Out Best Practices and Optimization](#advanced-aci-l3out-best-practices-and-optimization)
+    - [BGP Configuration Best Practices](#bgp-configuration-best-practices)
+    - [ACI L3Out Design Patterns](#aci-l3out-design-patterns)
+    - [VRF Tag and Loop Prevention](#vrf-tag-and-loop-prevention)
+    - [Scale Optimization Techniques](#scale-optimization-techniques)
+    - [High Availability and Monitoring](#high-availability-and-monitoring)
+    - [Troubleshooting and Validation](#troubleshooting-and-validation)
+10. [Network Policies and Security with Cilium](#network-policies-and-security-with-cilium)
+    - [Layer 3/4 Network Policies](#layer-34-network-policies)
+    - [DNS-Aware Security Policies](#dns-aware-security-policies)
+    - [Service Mesh Integration](#service-mesh-integration)
+    - [Encryption and Traffic Protection](#encryption-and-traffic-protection)
+    - [Security Monitoring and Compliance](#security-monitoring-and-compliance)
+11. [Summary](#summary)
+12. [Conclusion](#conclusion)
+13. [References and Additional Resources](#references-and-additional-resources)
 
 ---
 
 ## Introduction
-This document provides a comprehensive guide to deploying Cilium as a CNI on Kubernetes and OpenShift Container Platform (OCP), establishing eBGP peering with Cisco ACI L3Outs, advertising pod and service CIDRs. It covers advanced topics such as scale optimization, firewalling, and high-availability node networking.
+This document provides a comprehensive guide to deploying Cilium as a CNI on Kubernetes or OpenShift Container Platform (OCP), establishing eBGP peering with Cisco ACI L3Outs, advertising pod and service CIDRs. It covers advanced topics such as scale optimization, firewalling, and high-availability node networking.
 
 The guide addresses both vanilla Kubernetes and OpenShift deployments, highlighting the differences in configuration, security contexts, and operational procedures. OpenShift's enterprise-focused features such as Security Context Constraints (SCCs), operators, and integrated monitoring are covered alongside traditional Kubernetes approaches.
 
@@ -118,19 +139,17 @@ vNIC Templates:
     
   k8s-node-primary:
     Fabric: A  
-    Redundancy Type: Primary
     VLAN: 200 (Node Network - BGP Peering to L3Out)
     MTU: 9000
-    MAC Pool: k8s-node-mac-pool
+    MAC Pool: k8s-node-mac-pool-A
     Pin Group: k8s-node-pin-group
     QoS Policy: k8s-high-priority
     
   k8s-node-secondary:
     Fabric: B
-    Redundancy Type: Secondary
     VLAN: 200 (Node Network - BGP Peering to L3Out)
     MTU: 9000
-    MAC Pool: k8s-node-mac-pool
+    MAC Pool: k8s-node-mac-pool-B
     Pin Group: k8s-node-pin-group
     QoS Policy: k8s-high-priority
 ```
@@ -203,23 +222,23 @@ Network Control Policy: k8s-network-control
 
 ### 2. **Network Infrastructure**
 
-   - The computer/node network is the primary subnet used to assign static IP addresses to each Kubernetes or OpenShift node. This network is mapped to a dedicated ACI bridge domain and EPG, and is the source of BGP peering between the nodes and the ACI fabric via the L3Out. Each node receives an IP from this pool, and the subnet must be routable through the ACI L3Out to external networks.
+   - The **computer/node network** is the primary subnet used to assign static IP addresses to each Kubernetes or OpenShift node. This network is mapped to a dedicated ACI bridge domain and EPG, and is the source of BGP peering between the nodes and the ACI fabric via the L3Out. Each node receives an IP from this pool, and the subnet must be routable through the ACI L3Out to external networks.
 
      - Node subnet: 10.1.0.0/24 (Initial bridge-domain)
 
-   - The Pod CIDR defines the address range used for allocating IPs to pods within the cluster. For Kubernetes, the default is 10.244.0.0/16; for OpenShift, it is 10.128.0.0/14. These CIDRs are advertised to the ACI fabric over BGP through the L3Out, allowing external networks to reach pods directly when required. Each node typically advertises its local pod subnet to reduce BGP table size and optimize routing.
+   - The **Pod CIDR** defines the address range used for allocating IPs to pods within the cluster. For Kubernetes, the default is 10.244.0.0/16; for OpenShift, it is 10.128.0.0/14. These CIDRs are advertised to the ACI fabric over BGP through the L3Out, allowing external networks to reach pods directly when required. Each node typically advertises its local pod subnet to reduce BGP table size and optimize routing.
 
      - Pod CIDR: 10.244.0.0/16 (Kubernetes default)
      - Pod CIDR: 10.128.0.0/14 (OpenShift default)
 
-   - The Service CIDR is the address range used for Kubernetes or OpenShift services (virtual IPs for cluster services). The default for Kubernetes is 10.96.0.0/12, and for OpenShift it is 172.30.0.0/16. These CIDRs are also advertised to the ACI fabric via the L3Out, enabling external access to cluster services as needed.
+   - The **Service CIDR** is the address range used for Kubernetes or OpenShift services (virtual IPs for cluster services). The default for Kubernetes is 10.96.0.0/12, and for OpenShift it is 172.30.0.0/16. These CIDRs are also advertised to the ACI fabric via the L3Out, enabling external access to cluster services as needed.
 
      - Service CIDR: 10.96.0.0/12 (Kubernetes default)
      - Service CIDR: 172.30.0.0/16 (OpenShift default)
 
    - All three networks (node, pod, and service) must be properly defined in ACI as bridge domains and included in the L3Out configuration. This ensures that BGP advertisements from Cilium are accepted and routed by the ACI fabric, and that external connectivity is available for both pods and services.
 
-   - Configure DNS resolution **Important**
+   - Configure DNS resolution **Important Note**
 
      - For Kubernetes, ensure that all nodes can resolve the cluster.local domain, which is the default DNS suffix for services and pods. This typically involves configuring CoreDNS or kube-dns as the cluster DNS service, and setting the appropriate search domains and upstream resolvers in `/etc/resolv.conf` on each node. If using custom node images or bare metal, verify that the node-level DNS configuration does not override or conflict with cluster DNS settings.
 
@@ -406,7 +425,7 @@ echo 8 > /sys/class/net/ens4/device/sriov_numvfs
 
 - Configure node anti-affinity for control plane components
 
-## Installing Cilium on Kubernetes and OpenShift
+## Installing Cilium on Kubernetes or OpenShift
 ### 1. **Prerequisites Verification**
 
 #### For Kubernetes:
@@ -774,7 +793,10 @@ With ACI L3Out infrastructure in place, the next step is to establish eBGP peeri
 
 Create the Cilium BGP peering policy to enable eBGP sessions:
 
+
 ```yaml
+# cilium-bgp-peering-policy.yaml
+
 apiVersion: cilium.io/v2alpha1
 kind: CiliumBGPPeeringPolicy
 metadata:
@@ -891,6 +913,8 @@ Once BGP sessions are established, configure and verify route advertisements for
 Update the Cilium BGP policy to enable pod CIDR advertisements:
 
 ```yaml
+# cilium-bgp-peering-policy.yaml
+
 apiVersion: cilium.io/v2alpha1  
 kind: CiliumBGPPeeringPolicy
 metadata:
@@ -949,6 +973,8 @@ show bgp ipv4 unicast vrf k8s-vrf | include 10.244
 Configure service advertisements by updating the BGP policy:
 
 ```yaml
+# cilium-bgp-peering-policy.yaml
+
 apiVersion: cilium.io/v2alpha1
 kind: CiliumBGPPeeringPolicy
 metadata:
@@ -1408,7 +1434,6 @@ oc expose svc hubble-ui -n cilium
 oc get route hubble-ui -n cilium
 
 # Integrate with OpenShift monitoring
-oc create -f - <<EOF
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -1421,7 +1446,6 @@ spec:
   selector:
     matchLabels:
       k8s-app: hubble
-EOF
 ```
 
 #### Policy Audit Mode (Common):
