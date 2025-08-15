@@ -800,7 +800,7 @@ Create the Cilium BGP peering policy to enable eBGP sessions:
 apiVersion: cilium.io/v2alpha1
 kind: CiliumBGPPeeringPolicy
 metadata:
-  name: aci-bgp-peering
+  name: cilium-bgp-peering-policy
 spec:
   nodeSelector:
     matchLabels:
@@ -918,7 +918,7 @@ Update the Cilium BGP policy to enable pod CIDR advertisements:
 apiVersion: cilium.io/v2alpha1  
 kind: CiliumBGPPeeringPolicy
 metadata:
-  name: aci-bgp-peering-with-pods
+  name: cilium-bgp-peering-policy
 spec:
   nodeSelector:
     matchLabels:
@@ -978,7 +978,7 @@ Configure service advertisements by updating the BGP policy:
 apiVersion: cilium.io/v2alpha1
 kind: CiliumBGPPeeringPolicy
 metadata:
-  name: aci-bgp-peering-with-services
+  name: cilium-bgp-peering-policy
 spec:
   nodeSelector:
     matchLabels:
@@ -1081,7 +1081,7 @@ show ip route vrf k8s-vrf 10.96.0.0/12
 apiVersion: cilium.io/v2alpha1
 kind: CiliumBGPPeeringPolicy
 metadata:
-  name: aci-ebgp-production
+  name: cilium-bgp-peering-policy
 spec:
   nodeSelector:
     matchLabels:
