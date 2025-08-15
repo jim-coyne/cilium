@@ -1095,8 +1095,11 @@ Following Cisco best practices for route control and security:
 
 ```yaml
 # ACI External EPG Subnet Scopes (configured in APIC)
+
 External_EPG_Subnets:
+
   # For contract classification (longest prefix match)
+
   external_subnets_for_external_epg:
     - 10.244.0.0/16    # Kubernetes pods (import routes)
     - 10.96.0.0/12     # Kubernetes services (import routes)
@@ -1133,6 +1136,7 @@ VRF_Settings:
 #### Route Summarization:
 ```yaml
 # Cilium route summarization for large deployments
+
 apiVersion: cilium.io/v2alpha1
 kind: CiliumBGPClusterConfig
 metadata:
