@@ -1126,7 +1126,7 @@ VRF_Settings:
 - Use **BGP communities** for granular route control
 - Implement **route-maps** for prefix filtering
 - Configure **prefix limits** to prevent route table overflow
-- Enable **BFD** for fast convergence
+- Enable **BFD** for fast convergence - Cilium (via GoBGP) will automatically respond to BFD if (ACI) initiates it.
 
 ### 4. **Scale Optimization Techniques**
 
