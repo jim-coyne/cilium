@@ -659,7 +659,8 @@ Before establishing BGP peering with Cilium, the ACI fabric must be properly con
 ### 1. **Creating Core ACI Objects**
 
 #### Step 1: Create Tenant and VRF
-Configure the foundational ACI objects to host Kubernetes networks:
+
+This step establishes the logical boundaries and routing domains in Cisco ACI that will contain and isolate your Kubernetes/OpenShift networking objects.
 
 ```yaml
 # Tenant Configuration
@@ -674,17 +675,18 @@ Route Target: auto-generated
 ```
 
 #### Step 2: Create L3Out for External Connectivity
+
 Configure the L3Out that will peer with Cilium nodes:
 
 ```yaml
 # L3Out Configuration
-Name: k8s-l3out
-VRF: k8s-vrf
-Domain: l3dom_k8s
-BGP ASN: 65002
+Name: k8s-l3out  
+VRF: k8s-vrf 
+Domain: l3dom_k8s 
+BGP ASN: 65002 
 
 # Logical Node Profile
-Logical Node Profile: k8s-border-leafs
+Logical Node Profile: k8s-border-leafs # 
 Nodes: leaf-101, leaf-102
 Router ID Loopback: enabled
 BGP Route Reflector Client: disabled
@@ -747,7 +749,7 @@ Scope: Public, Shared
 
 ### 3. **External EPG and Route Control**
 
-Configure External EPG for route advertisement control:
+Configure External EPG for route advertisement control. Route Controlling Subnets ensure only the necessary Kubernetes/OpenShift pod and service networks are advertised externally, and that the default route is imported for outbound connectivity. The export-rtctrl and shared-rtctrl flags enable route advertisement and sharing, while import-security and shared-security ensure secure import of external routes.
 
 ```yaml
 # External EPG Configuration
@@ -823,14 +825,15 @@ ping -M do -s 8972 10.1.0.1  # Test with 9000 MTU
 ```
 
 #### Step 2: Configure ACI BGP Peers for Each Node
-For each Kubernetes node, add BGP peer configuration in ACI:
 
-**APIC Configuration Path:**
-`Tenants → k8s-prod → Networking → L3Outs → k8s-l3out → Logical Node Profiles → k8s-border-leafs → BGP Peer Connectivity Profiles`
+In this step, you configure the Cisco ACI fabric to establish a dedicated BGP peering session with each Kubernetes node. This enables dynamic exchange of routing information between ACI and the Cilium BGP control plane running on each node.
 
-**Per-Node BGP Peer Configuration:**
+* Repeat this configuration for each Kubernetes node in the cluster.
+
 ```yaml
+
 # Example for node k8s-worker-01 (IP: 10.1.0.10)
+
 BGP_Peer_Configuration:
   Peer_Address: 10.1.0.10      # Kubernetes node IP
   Remote_ASN: 65001            # Cilium ASN
@@ -844,17 +847,14 @@ BGP_Peer_Configuration:
   Send_Extended_Community: enabled
 ```
 
-Repeat this configuration for each Kubernetes node in the cluster.
-
 #### Step 3: Apply Cilium BGP Policy
 Deploy the BGP peering policy:
 
 ```bash
 # Kubernetes
-kubectl apply -f cilium-bgp-peering-policy.yaml
-
+kubectl apply -f cilium-bgp-peering-policy.yaml # defined earlier
 # OpenShift
-oc apply -f cilium-bgp-peering-policy.yaml
+oc apply -f cilium-bgp-peering-policy.yaml # defined earlier
 ```
 
 ### 3. **BGP Session Verification**
