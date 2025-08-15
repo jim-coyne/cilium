@@ -749,7 +749,7 @@ Scope: Public, Shared
 
 ### 3. **External EPG and Route Control**
 
-Configure External EPG for route advertisement control. Route Controlling Subnets ensure only the necessary Kubernetes/OpenShift pod and service networks are advertised externally, and that the default route is imported for outbound connectivity. The export-rtctrl and shared-rtctrl flags enable route advertisement and sharing, while import-security and shared-security ensure secure import of external routes.
+Configure External EPG for route advertisement control. The export-rtctrl and shared-rtctrl flags enable route advertisement and sharing, while import-security and shared-security ensure secure import of external routes.
 
 ```yaml
 # External EPG Configuration
@@ -772,7 +772,7 @@ With ACI L3Out infrastructure in place, the next step is to establish eBGP peeri
 
 ### 1. **Cilium BGP Configuration**
 
-Deploy the Cilium BGP peering policy to enable eBGP sessions:
+Create the Cilium BGP peering policy to enable eBGP sessions:
 
 ```yaml
 apiVersion: cilium.io/v2alpha1
@@ -807,8 +807,6 @@ spec:
         restartTimeSeconds: 300
 ```
 
-### 3. **Establishing eBGP Connections to Each Node**
-
 ### 2. **Per-Node BGP Session Setup**
 
 #### Step 1: Verify Node Network Connectivity
@@ -826,7 +824,7 @@ ping -M do -s 8972 10.1.0.1  # Test with 9000 MTU
 
 #### Step 2: Configure ACI BGP Peers for Each Node
 
-In this step, you configure the Cisco ACI fabric to establish a dedicated BGP peering session with each Kubernetes node. This enables dynamic exchange of routing information between ACI and the Cilium BGP control plane running on each node.
+In this step, you configure the Cisco ACI fabric to establish a dedicated BGP peering session with each Kubernetes node. 
 
 * Repeat this configuration for each Kubernetes node in the cluster.
 
@@ -884,20 +882,6 @@ show bgp ipv4 unicast summary vrf k8s-vrf
 # Check specific neighbor details
 show bgp ipv4 unicast neighbors 10.1.0.10 vrf k8s-vrf
 ```
-
-#### Troubleshooting BGP Sessions
-Common issues and solutions:
-
-1. **Session Stuck in Active/Connect:**
-   - Verify IP connectivity between nodes and border leafs
-   - Check firewall rules allowing BGP port 179
-   - Confirm ASN configuration matches on both sides
-
-2. **Timer Mismatches:**
-   - Ensure hold/keepalive timers match between Cilium and ACI
-   - ACI: 180s hold, 60s keepalive
-   - Cilium: Same timers in BGP policy
-
 ## BGP Route Advertisements
 
 Once BGP sessions are established, configure and verify route advertisements for pod CIDRs and service networks. This section covers the configuration of BGP advertisements and monitoring.
@@ -1061,33 +1045,9 @@ show bgp ipv4 unicast vrf k8s-vrf
 show ip route vrf k8s-vrf 10.244.0.0/16
 show ip route vrf k8s-vrf 10.96.0.0/12
 ```
-
-#### Production Monitoring Script:
-```bash
-#!/bin/bash
-# BGP Route Advertisement Monitoring
-while true; do
-  echo "=== BGP Session Status $(date) ==="
-  kubectl exec -n kube-system ds/cilium -- cilium bgp peers | grep -E "(Peer|Established|Active)"
-  
-  echo "=== Pod CIDR Routes ==="
-  kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised | grep -c "10.244"
-  
-  echo "=== Service Routes ==="
-  kubectl exec -n kube-system ds/cilium -- cilium bgp routes advertised | grep -c "10.96"
-  
-  sleep 30
-done
-```
-
 ## Advanced ACI L3Out Best Practices and Optimization
 
 ### 1. **BGP Configuration Best Practices**
-
-#### BGP AS Design:
-- **ACI Fabric AS**: Use private ASN range (64512-65534) for ACI fabric
-- **External AS**: Coordinate with network team for external device ASNs
-- **BGP Route Reflectors**: Deploy minimum 2 RR spines per pod for redundancy
 
 #### BGP Timer Optimization:
 ```yaml
@@ -1224,7 +1184,6 @@ kubectl exec -n kube-system ds/cilium -- cilium bgp routes received
 **BGP Session Flapping:**
 - Check MTU alignment between Cilium nodes and ACI
 - Verify BGP timer settings match ACI configuration
-- Validate network connectivity and firewall rules
 
 **Route Advertisement Problems:**
 - Confirm ACI External EPG subnet scopes
@@ -1234,7 +1193,6 @@ kubectl exec -n kube-system ds/cilium -- cilium bgp routes received
 **Performance Issues:**
 - Enable BGP graceful restart for maintenance windows
 - Implement route dampening for unstable routes
-- Use BFD for fast failure detection
 
 #### Diagnostic Commands:
 ```bash
@@ -1496,20 +1454,17 @@ data:
 
 ### Summary:
 
-For manual ACI configuration or infrastructure as code automation, create the following objects in APIC:
-
-#### Essential ACI Objects:
-1. **Tenant and VRF**: k8s-prod tenant with k8s-vrf (policy control enforced)
-2. **L3Out**: k8s-l3out with BGP ASN 65002, associated with k8s-vrf
-3. **Border Leaf Configuration**: BGP peers on leaf-101/102 with Router ID loopback
-4. **External EPG**: k8s-external-epg with route control subnets for pod/service CIDRs
-5. **Bridge Domains**: Create BDs for node, pod, and service networks with proper scoping
-
-#### Key Configuration Parameters:
-- **BGP Timers**: Hold=180s, Keepalive=60s (production recommended)
-- **Route Control**: Export-only for pod/service CIDRs, import for management networks
-- **VRF Policy**: Ingress policy control with enforced direction
-- **External EPG Subnets**: Use export-rtctrl scope for Kubernetes networks
+* Connect UCS B-Series and Cisco ACI fabric for Kubernetes/OpenShift installation.
+* Provision cluster nodes with high-availability networking (active/backup bonding).
+* Configure ACI tenants, VRFs, bridge domains.
+* Define node, pod, and service CIDRs, map them to ACI bridge domains and L3Outs.
+* Install Cilium CNI with BGP control plane on Kubernetes/OpenShift.
+* Configure eBGP peering between Cilium nodes and ACI border leaf switches.
+* Set up Cilium BGP policies to advertise pod and service CIDRs to ACI.
+* Verify BGP session establishment and route advertisement from both Cilium and ACI.
+* Implement advanced ACI L3Out best practices (timers, route control, communities, summarization).
+* Enable observability and monitoring with Hubble, Prometheus, and ACI diagnostics.
+* Apply Cilium network policies for L3-L7 security and compliance.
 
 ## Conclusion
 Deploying Cilium with eBGP peering to Cisco ACI L3Outs represents a sophisticated approach to enterprise Kubernetes networking that bridges the gap between cloud-native workloads and traditional data center infrastructure. This comprehensive integration enables organizations to leverage the advanced networking capabilities of both platforms while maintaining the security, observability, and scalability requirements of modern enterprise environments.
